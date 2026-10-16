@@ -20,6 +20,7 @@ pub fn cmd_write_devirt(
     output: &std::path::Path,
     steps: usize,
     timeout: u64,
+    max_blocks: usize,
     vm_section: &str,
     jobs: Option<usize>,
 ) -> Result<()> {
@@ -30,7 +31,8 @@ pub fn cmd_write_devirt(
         "devirtualizing {} functions… ({jobs} at a time)",
         entries.len()
     );
-    let (out, report) = writeback::write_devirt(&pe, &entries, steps, timeout, vm_section, jobs)?;
+    let (out, report) =
+        writeback::write_devirt(&pe, &entries, steps, timeout, max_blocks, vm_section, jobs)?;
     std::fs::write(output, &out)?;
     println!("wrote {} bytes to {:?}", out.len(), output);
 

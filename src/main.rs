@@ -159,6 +159,9 @@ enum Cmd {
         /// Wall-clock backstop per function.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// Maximum blocks to recover per function.
+        #[arg(long, default_value_t = 512)]
+        max_blocks: usize,
         /// Section holding VM bytecode.
         #[arg(long, default_value = vm::DEFAULT_VM_SECTION)]
         vm_section: String,
@@ -268,9 +271,18 @@ fn main() -> Result<()> {
             output,
             steps,
             timeout,
+            max_blocks,
             vm_section,
             jobs,
-        } => cmd_write_devirt(&input, &output, steps, timeout, &vm_section, jobs),
+        } => cmd_write_devirt(
+            &input,
+            &output,
+            steps,
+            timeout,
+            max_blocks,
+            &vm_section,
+            jobs,
+        ),
         Cmd::Devirt {
             input,
             va,

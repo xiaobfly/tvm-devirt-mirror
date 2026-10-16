@@ -1,6 +1,7 @@
 //! Write recovered functions into the PE, then patch each entry trampoline to jmp to its recovered counterpart.
 
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::binary::pe::PeFile;
@@ -108,6 +109,7 @@ pub fn write_devirt(
     entries: &[VmEntry],
     steps: usize,
     timeout_secs: u64,
+    max_blocks: usize,
     vm_section: &str,
     jobs: usize,
 ) -> Result<(Vec<u8>, DevirtReport)> {
@@ -125,7 +127,7 @@ pub fn write_devirt(
             .par_iter()
             .map(|e| {
                 let started = std::time::Instant::now();
-                let prepared = prepare_one(pe, e, steps, timeout_secs, vm_section);
+                let prepared = prepare_one(pe, e, steps, timeout_secs, max_blocks, vm_section);
                 let elapsed = started.elapsed();
                 let n = recovered.fetch_add(1, Ordering::Relaxed) + 1;
                 let blocks = prepared.cfg.blocks.len();
@@ -420,10 +422,12 @@ fn prepare_one(
     entry: &VmEntry,
     steps: usize,
     timeout_secs: u64,
+    max_blocks: usize,
     vm_section: &str,
 ) -> PreparedFn {
     let mut ex = explore::Explorer::with_vm_section(pe, crate::vm::DEFAULT_STACK_BASE, vm_section);
     ex.step_budget = steps;
+    ex.block_budget = max_blocks;
     ex.time_budget = std::time::Duration::from_secs(timeout_secs);
 
     let cfg = ex.recover(entry.vm_entry_va);
@@ -450,7 +454,12 @@ fn why_incomplete(cfg: &ir::Cfg) -> Option<String> {
         return Some("recovery timed out".to_string());
     }
     if cfg.unresolved != 0 {
-        return Some(format!("{} block(s) never resolved", cfg.unresolved));
+        let reasons = unresolved_reasons(cfg);
+        return Some(if reasons.is_empty() {
+            format!("{} block(s) never resolved", cfg.unresolved)
+        } else {
+            format!("{} block(s) never resolved: {reasons}", cfg.unresolved)
+        });
     }
     let issues = explore::validate(cfg);
     if !issues.is_clean() {
@@ -459,10 +468,106 @@ fn why_incomplete(cfg: &ir::Cfg) -> Option<String> {
     None
 }
 
+/// The distinct `Unresolved` reasons, counted, as one short line.
+///
+/// Several reasons embed a long expression, so each is truncated before grouping
+/// and display. Ordering is deterministic (the map sorts the truncated reasons)
+/// and only the first few groups are shown.
+fn unresolved_reasons(cfg: &ir::Cfg) -> String {
+    const MAX_REASON_CHARS: usize = 60;
+    const MAX_REASON_GROUPS: usize = 3;
+
+    let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+    for block in &cfg.blocks {
+        if let ir::Terminator::Unresolved { reason } = &block.terminator {
+            *groups
+                .entry(truncate_reason(reason, MAX_REASON_CHARS))
+                .or_default() += 1;
+        }
+    }
+    let mut shown: Vec<String> = groups
+        .iter()
+        .take(MAX_REASON_GROUPS)
+        .map(|(reason, n)| format!("{n}x {reason}"))
+        .collect();
+    if groups.len() > MAX_REASON_GROUPS {
+        shown.push(format!("+{} more", groups.len() - MAX_REASON_GROUPS));
+    }
+    shown.join(", ")
+}
+
+/// `reason`, cut to at most `max_chars` characters with a marker when shortened.
+fn truncate_reason(reason: &str, max_chars: usize) -> String {
+    match reason.char_indices().nth(max_chars) {
+        Some((cut, _)) => format!("{}…", &reason[..cut]),
+        None => reason.to_string(),
+    }
+}
+
 fn align_up_u32(v: u32, align: u32) -> u32 {
     (v + align - 1) / align * align
 }
 
 fn write_u32_at(buf: &mut Vec<u8>, off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::expr::{Arena, BlockRef, Reg};
+    use crate::ir::{Block, BlockId, Terminator};
+
+    fn block(handler: u64, terminator: Terminator) -> Block {
+        Block {
+            id: BlockId { handler, vip: None },
+            block_ref: BlockRef(handler as u32),
+            params: Vec::new(),
+            events: Vec::new(),
+            from_vm_context: false,
+            exit_regs: Vec::new(),
+            terminator,
+            cost: 0,
+            preds: Vec::new(),
+        }
+    }
+
+    /// A caller has to be able to tell *why* blocks stayed unresolved, not just
+    /// how many did: the per-block reasons are aggregated with their counts.
+    #[test]
+    fn unresolved_reasons_are_reported_per_block() {
+        let mut arena = Arena::default();
+        let dest = arena.init_reg(Reg::Rax);
+        let cfg = ir::Cfg {
+            entry: BlockId { handler: 0, vip: None },
+            arena,
+            blocks: vec![
+                block(
+                    0,
+                    Terminator::Unresolved {
+                        reason: "block budget reached".into(),
+                    },
+                ),
+                block(
+                    1,
+                    Terminator::Unresolved {
+                        reason: "unsupported at 0x14008aabe: int 29h".into(),
+                    },
+                ),
+                block(2, Terminator::Return { dest }),
+            ],
+            total_steps: 0,
+            unresolved: 2,
+            back_edges: Vec::new(),
+            trivial_phis_removed: 0,
+            timed_out: false,
+            stack_base: crate::vm::DEFAULT_STACK_BASE,
+            vm_range: (0, 0),
+        };
+
+        let why = why_incomplete(&cfg).expect("unresolved blocks must be reported");
+        assert!(why.contains("2 block(s) never resolved"), "{why}");
+        assert!(why.contains("block budget reached"), "{why}");
+        assert!(why.contains("unsupported at 0x14008aabe: int 29h"), "{why}");
+    }
 }
