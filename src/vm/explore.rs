@@ -163,6 +163,11 @@ impl<'a> Explorer<'a> {
         }
         let mut cfg = self.recover_pass_with(start, &joins, Some(&first), vip_slot);
         cfg.trivial_phis_removed = cfg.simplify_phis();
+        // A join that only this pass found was not cut, so its descendants still
+        // reference the entry values of blocks they do not own; give each of those
+        // references a parameter of the block that uses it before the prune below
+        // decides which parameters anything reads.
+        cfg.localize_params();
         cfg.remove_dead_params();
         cfg
     }

@@ -216,31 +216,7 @@ impl Cfg {
     /// Remove parameters that the block's body never reads.
     pub fn remove_dead_params(&mut self) {
         for b in &mut self.blocks {
-            let mut refs: Vec<Ref> = Vec::new();
-            for (_, v) in &b.exit_regs {
-                refs.push(*v);
-            }
-            for e in &b.events {
-                match e {
-                    Event::Store { addr, value, .. } | Event::Load { addr, value, .. } => {
-                        refs.push(*addr);
-                        refs.push(*value);
-                    }
-                    Event::Call { target, args, .. } => {
-                        if let Some(t) = target {
-                            refs.push(*t);
-                        }
-                        refs.extend(args.iter().map(|(_, v)| *v));
-                    }
-                    Event::Boxed { .. } => {}
-                }
-            }
-            match &b.terminator {
-                Terminator::Branch { predicate, .. } => refs.push(*predicate),
-                Terminator::Switch { selector, .. } => refs.push(*selector),
-                Terminator::Return { dest } => refs.push(*dest),
-                _ => {}
-            }
+            let refs = block_roots(b);
             let mut used: HashSet<Ref> = HashSet::new();
             for r in refs {
                 for leaf in expr::leaves(&self.arena, r) {
@@ -248,6 +224,75 @@ impl Cfg {
                 }
             }
             b.params.retain(|(_, p)| used.contains(p));
+        }
+    }
+
+    /// Restore SSA scoping: rewrite every [`expr::Op::Param`] a block reaches that is
+    /// owned by another block into a parameter the block owns itself.
+    ///
+    /// A parameter names the value one guest register held on entry to one specific
+    /// block, so a block may only use parameters it declares itself: a value it holds
+    /// arrived at *its* entry, through *its* boundary. Recovery cuts parameters at the
+    /// joins an earlier pass found, and a join only a later pass discovers -- or one
+    /// whose guest context could not be located, so `seed_guest_params` had nothing to
+    /// cut -- leaves the blocks below it reaching for an ancestor's entry value. That
+    /// value is not what their own incoming edge carries, and no predecessor delivers
+    /// it, so reading it as this block's parameter means reading the wrong slot.
+    ///
+    /// Rewriting such a reference into a parameter of the block that uses it makes the
+    /// value arrive through that block's ordinary boundary move instead: [`Cfg::phis`]
+    /// then supplies one incoming value per predecessor, taken from that predecessor's
+    /// `exit_regs`. The two forms agree while nothing writes `reg` along the path, the
+    /// assumption the original cut was made under; where something does write it, the
+    /// localized form is the true one.
+    pub fn localize_params(&mut self) {
+        for b in &mut self.blocks {
+            let owner = b.block_ref;
+            // A second parameter for a register the block already declares would make
+            // `phis` describe two different values arriving on the same edge, and the
+            // declared entry is already the arena's interned `Param(owner, reg)` node,
+            // so it is exactly what a fresh `arena.param` call would return. Reuse it.
+            let mut declared: HashMap<expr::Reg, Ref> = b.params.iter().copied().collect();
+            let mut map: HashMap<Ref, Ref> = HashMap::new();
+            for root in block_roots(b) {
+                for leaf in expr::leaves(&self.arena, root) {
+                    // Copied out of the node: the arena is mutated below, so nothing
+                    // may stay borrowed across it.
+                    let param_reg = match self.arena.op(leaf) {
+                        expr::Op::Param(param_owner, reg) if *param_owner != owner => *reg,
+                        _ => continue,
+                    };
+                    let replacement = match declared.get(&param_reg) {
+                        Some(param) => *param,
+                        None => {
+                            let param = self.arena.param(owner, param_reg);
+                            declared.insert(param_reg, param);
+                            b.params.push((param_reg, param));
+                            param
+                        }
+                    };
+                    map.insert(leaf, replacement);
+                }
+            }
+            if map.is_empty() {
+                continue;
+            }
+            for (_, v) in &mut b.exit_regs {
+                *v = self.arena.rewrite(*v, &map);
+            }
+            for e in &mut b.events {
+                rewrite_event(&mut self.arena, e, &map);
+            }
+            match &mut b.terminator {
+                Terminator::Branch { predicate, .. } => {
+                    *predicate = self.arena.rewrite(*predicate, &map);
+                }
+                Terminator::Switch { selector, .. } => {
+                    *selector = self.arena.rewrite(*selector, &map);
+                }
+                Terminator::Return { dest } => *dest = self.arena.rewrite(*dest, &map),
+                _ => {}
+            }
         }
     }
 
@@ -289,6 +334,39 @@ pub fn summarize(cfg: &Cfg) -> HashMap<&'static str, usize> {
     m
 }
 
+/// Every expression a block evaluates: its exit register values, the operands of its
+/// events, and its terminator's operand. The dead-parameter prune and the parameter
+/// localization both decide what a block reads from this same set, so they take it from
+/// one place rather than keeping two copies of it in step.
+fn block_roots(b: &Block) -> Vec<Ref> {
+    let mut refs: Vec<Ref> = Vec::new();
+    for (_, v) in &b.exit_regs {
+        refs.push(*v);
+    }
+    for e in &b.events {
+        match e {
+            Event::Store { addr, value, .. } | Event::Load { addr, value, .. } => {
+                refs.push(*addr);
+                refs.push(*value);
+            }
+            Event::Call { target, args, .. } => {
+                if let Some(t) = target {
+                    refs.push(*t);
+                }
+                refs.extend(args.iter().map(|(_, v)| *v));
+            }
+            Event::Boxed { .. } => {}
+        }
+    }
+    match &b.terminator {
+        Terminator::Branch { predicate, .. } => refs.push(*predicate),
+        Terminator::Switch { selector, .. } => refs.push(*selector),
+        Terminator::Return { dest } => refs.push(*dest),
+        _ => {}
+    }
+    refs
+}
+
 /// Rewrite the expressions inside an event through `map`.
 fn rewrite_event(arena: &mut Arena, e: &mut Event, map: &HashMap<Ref, Ref>) {
     match e {
@@ -313,5 +391,155 @@ fn rewrite_event(arena: &mut Arena, e: &mut Event, map: &HashMap<Ref, Ref>) {
             }
         }
         Event::Boxed { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::expr::{BinOp, BlockRef, Reg, Width};
+
+    fn id(handler: u64) -> BlockId {
+        BlockId { handler, vip: None }
+    }
+
+    /// A block with no body. Every field is filled in, so the tests exercise the
+    /// struct the recovery engine actually builds.
+    fn block(block_ref: u32, id: BlockId, terminator: Terminator) -> Block {
+        Block {
+            id,
+            block_ref: BlockRef(block_ref),
+            params: Vec::new(),
+            events: Vec::new(),
+            from_vm_context: true,
+            exit_regs: Vec::new(),
+            terminator,
+            cost: 0,
+            preds: Vec::new(),
+        }
+    }
+
+    fn cfg(arena: Arena, blocks: Vec<Block>) -> Cfg {
+        Cfg {
+            entry: blocks[0].id,
+            arena,
+            blocks,
+            total_steps: 0,
+            unresolved: 0,
+            back_edges: Vec::new(),
+            trivial_phis_removed: 0,
+            timed_out: false,
+            stack_base: 0x7ff0_0000,
+            vm_range: (0, 0),
+        }
+    }
+
+    /// Every parameter owned by another block that is reachable from `b`'s roots,
+    /// one entry per distinct node.
+    fn foreign_params(cfg: &Cfg, b: &Block) -> Vec<(BlockRef, Reg)> {
+        let mut seen: HashSet<Ref> = HashSet::new();
+        let mut out = Vec::new();
+        for root in block_roots(b) {
+            for leaf in expr::leaves(&cfg.arena, root) {
+                if !seen.insert(leaf) {
+                    continue;
+                }
+                if let expr::Op::Param(owner, reg) = cfg.arena.op(leaf)
+                    && *owner != b.block_ref
+                {
+                    out.push((*owner, *reg));
+                }
+            }
+        }
+        out
+    }
+
+    /// Recovery left block 1 using block 0's entry value for RCX. The pass has to
+    /// turn that into a parameter block 1 owns, everywhere the value appears.
+    #[test]
+    fn a_foreign_parameter_becomes_a_parameter_of_the_block_that_uses_it() {
+        let mut arena = Arena::new();
+        let foreign = arena.param(BlockRef(0), Reg::Rcx);
+        // Nested in a larger expression as well as used bare, so renaming has to
+        // reach through the DAG rather than only matching the root.
+        let one = arena.constant(1, Width::W64);
+        let nested = arena.bin(BinOp::Add, foreign, one);
+
+        let mut first = block(0, id(0x10), Terminator::Jump(id(0x20)));
+        first.exit_regs = vec![(Reg::Rcx, foreign)];
+        let mut second = block(1, id(0x20), Terminator::Return { dest: nested });
+        second.preds = vec![id(0x10)];
+        second.exit_regs = vec![(Reg::Rcx, foreign)];
+
+        let mut cfg = cfg(arena, vec![first, second]);
+        assert_eq!(
+            foreign_params(&cfg, &cfg.blocks[1]),
+            vec![(BlockRef(0), Reg::Rcx)],
+            "the fixture has to start out scoping-violating, or it proves nothing"
+        );
+
+        cfg.localize_params();
+
+        let b = &cfg.blocks[1];
+        let [(reg, param)] = b.params[..] else {
+            panic!(
+                "block 1 must declare exactly one parameter, got {:?}",
+                b.params
+            )
+        };
+        assert_eq!(reg, Reg::Rcx);
+        assert_eq!(
+            cfg.arena.op(param),
+            &expr::Op::Param(BlockRef(1), Reg::Rcx),
+            "the replacement has to be owned by block 1, not by block 0"
+        );
+        assert_eq!(
+            b.exit_regs[0].1, param,
+            "the exit value has to be rewritten onto the new parameter"
+        );
+        let Terminator::Return { dest } = &b.terminator else {
+            panic!("terminator changed variant")
+        };
+        assert!(
+            expr::leaves(&cfg.arena, *dest).contains(&param),
+            "the value inside the return expression was not renamed"
+        );
+        assert_eq!(
+            foreign_params(&cfg, b),
+            Vec::new(),
+            "a parameter of another block is still reachable"
+        );
+    }
+
+    /// A parameter the block already owns needs no localization: same register, same
+    /// owner, so the reference and the parameter list must come out unchanged.
+    #[test]
+    fn a_block_that_only_uses_its_own_parameter_is_untouched() {
+        let mut arena = Arena::new();
+        let own = arena.param(BlockRef(1), Reg::Rcx);
+
+        let mut second = block(1, id(0x20), Terminator::Return { dest: own });
+        second.preds = vec![id(0x10)];
+        second.exit_regs = vec![(Reg::Rcx, own)];
+        second.params = vec![(Reg::Rcx, own)];
+        let first = block(0, id(0x10), Terminator::Jump(id(0x20)));
+
+        let mut cfg = cfg(arena, vec![first, second]);
+        cfg.localize_params();
+
+        let b = &cfg.blocks[1];
+        assert_eq!(
+            b.params,
+            vec![(Reg::Rcx, own)],
+            "the parameter list changed"
+        );
+        assert_eq!(b.exit_regs[0].1, own, "the exit value was rewritten");
+        assert_eq!(b.exit_regs.len(), 1, "a parameter was invented");
+        assert_eq!(
+            cfg.arena.op(own),
+            &expr::Op::Param(BlockRef(1), Reg::Rcx),
+            "the fixture's parameter is not the block's own"
+        );
+        assert!(foreign_params(&cfg, b).is_empty());
     }
 }
