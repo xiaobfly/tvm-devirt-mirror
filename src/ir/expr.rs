@@ -323,6 +323,10 @@ impl Arena {
     /// still in use. A machine that writes a fresh opaque value into a register or a flag on
     /// every step makes those two numbers diverge enormously, and only the second is what a
     /// folding limit should be measuring. Reachability from the live roots is that number.
+    ///
+    /// Only the tests need this today: nothing on the recovery path calls it, so it is
+    /// compiled for test builds alone rather than left as a dead-code warning.
+    #[cfg(test)]
     pub fn reachable_from(&self, roots: &[Ref]) -> usize {
         let mut seen = vec![false; self.nodes.len()];
         let mut stack: Vec<Ref> = roots.to_vec();
