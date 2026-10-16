@@ -36,9 +36,10 @@ Recovery diagnostics: `vm/diag.rs` is an opt-in thread-local collector (pin/flag
 | `src/cli/` | `inspect.rs`, `recover.rs` (dump-only), `emit.rs` (only place that writes files), `fmt.rs` (shared printers), `diag.rs` (the `unresolved` subcommand) |
 | `src/vm/` | Entry discovery + stub census (`discover.rs`), guest machine state (`state.rs`), CFG exploration + `UnresolvedStats` (`explore.rs`), opt-in diagnostics sink (`diag.rs`) |
 | `docs/` | Mirror design/plan/validation notes for the arena-compaction work and the diagnostics |
-| `test/` | Fixture dir — one sample driver `test/ACE-SSC-DRV64.sys` (force-added despite `.gitignore:*.sys`) |
 
 No CI, no `tests/`/`benches/`, no scripts, no formatter/linter config anywhere in the repo.
+
+Sample driver: not in version control. The local copy currently sits at `target/release/test/ACE-SSC-DRV64.sys`, inside the gitignored `target/`, so `cargo clean` takes it with it — ask the user for another copy if it is gone.
 
 Five files hold most of the ~26k lines: `ir/lift.rs` (3933), `ir/expr.rs` (3774), `ir/sched.rs` (3708), `codegen/tests.rs` (2318), `vm/explore.rs` (2243). Read them in ranges; grep for the function name first.
 
@@ -54,7 +55,7 @@ cargo run -- <cmd> ...   # or ./target/debug/tvm-devirt.exe <cmd> ...
 ```
 
 ```bash
-tvm-devirt entries test/ACE-SSC-DRV64.sys --all   # 192 proven locations here; --include-stubs restores all 338
+tvm-devirt entries target/release/test/ACE-SSC-DRV64.sys --all   # 192 proven locations here; --include-stubs restores all 338
 tvm-devirt trace  <input> <va> [--events] [--dispatches] [--tail N] [--break-at VA]
 tvm-devirt cfg    <input> <va> [--events] [--state] [--steps N] [--max-blocks N] [--timeout S]
 tvm-devirt ssa    <input> <va> [--joins-only]
@@ -110,9 +111,9 @@ Also `info`, `dis --count N`, `vmctx --window N`. `--vm-section` (default `.tvm0
 
 - Framework: plain `#[cfg(test)] mod tests` in-module (Rust's built-in harness). `cargo test` needs no external fixtures and runs 208 tests in well under a second.
 - Coverage is concentrated in the IR and codegen layers: `src/codegen/tests.rs` (child module declared at `codegen/mod.rs:26`, reaches private emitters), `src/ir/expr.rs`, `src/ir/lift.rs`, `src/ir/sched.rs`, `src/ir/regalloc.rs`, `src/vm/explore.rs`, `src/vm/state.rs`, `src/vm/discover.rs`, `src/cli/diag.rs`.
-- **Untested**: `src/main.rs`, `inspect.rs`/`recover.rs`/`emit.rs`/`fmt.rs` under `src/cli/`, PE parsing and patch building in `src/binary/`, `src/vm/diag.rs`, `src/ir/hash.rs`. Changes there need a manual smoke run against `test/ACE-SSC-DRV64.sys`.
+- **Untested**: `src/main.rs`, `inspect.rs`/`recover.rs`/`emit.rs`/`fmt.rs` under `src/cli/`, PE parsing and patch building in `src/binary/`, `src/vm/diag.rs`, `src/ir/hash.rs`. Changes there need a manual smoke run against `target/release/test/ACE-SSC-DRV64.sys`.
 - Test naming is sentence-style snake_case describing the bug prevented, e.g. `a_spill_store_no_one_reads_is_removed` (`codegen/tests.rs:148`).
 - Assertions are text/structural, not golden files: `codegen/tests.rs` assembles with `CodeAssembler` and compares `NasmFormatter` output via helpers `emit_one`, `seg`, `disasm_bytes`; IR tests build synthetic PEs with `executable_pe` / `pe_with` (`ir/lift.rs:3085`, `:3322`).
 - Test-only helpers inside production modules are `#[cfg(test)]`-gated — keep them that way.
-- Smoke paths verified against the bundled sample: `entries` lists 192 proven locations by default and 338 with `--include-stubs`; `cfg`/`lower` recover 18 blocks (126 instructions) at `0x140001000`; `devirt` emits 877 bytes of x86 for it. Use these to check a change end-to-end.
-- Full-pipeline check: `cargo run -- write-devirt test/ACE-SSC-DRV64.sys out.sys --jobs 8 --timeout 30` reports `312 ready, 26 incomplete`, retargets 312 of 338 functions in ~85 s and writes a patched image; `--max-blocks 1024` gets `315 ready, 23` because the trampolines `0x14000a9e0`, `0x14000aa40` and `0x14000b681` share VM entry `0x14008b459`, which needs 689 blocks against the default budget of 512 (`prepare_one` in `src/binary/writeback.rs`). The sweep ends with the `UnresolvedStats` accounting (`unresolved=102 (block-budget truncated=21, genuine=81)`) plus the reason families (`left-image`, `block-budget`, `argument-dependent`, `unsupported`, `work-budget`, `unresolved-branch`) — `truncated` is cross-checked against `blocks − budget`, so a budget artefact can never be read as a recovery failure. A worker panic there means an SSA-scoping regression — that is what `src/ir/sched.rs:291-296` exists to catch; never delete the assertion.
+- Smoke paths verified against the local sample (`target/release/test/ACE-SSC-DRV64.sys`, untracked): `entries` lists 192 proven locations by default and 338 with `--include-stubs`; `cfg`/`lower` recover 18 blocks (126 instructions) at `0x140001000`; `devirt` emits 877 bytes of x86 for it. Use these to check a change end-to-end.
+- Full-pipeline check: `cargo run -- write-devirt target/release/test/ACE-SSC-DRV64.sys out.sys --jobs 8 --timeout 30` reports `312 ready, 26 incomplete`, retargets 312 of 338 functions in ~85 s and writes a patched image; `--max-blocks 1024` gets `315 ready, 23` because the trampolines `0x14000a9e0`, `0x14000aa40` and `0x14000b681` share VM entry `0x14008b459`, which needs 689 blocks against the default budget of 512 (`prepare_one` in `src/binary/writeback.rs`). The sweep ends with the `UnresolvedStats` accounting (`unresolved=102 (block-budget truncated=21, genuine=81)`) plus the reason families (`left-image`, `block-budget`, `argument-dependent`, `unsupported`, `work-budget`, `unresolved-branch`) — `truncated` is cross-checked against `blocks − budget`, so a budget artefact can never be read as a recovery failure. A worker panic there means an SSA-scoping regression — that is what `src/ir/sched.rs:291-296` exists to catch; never delete the assertion.
