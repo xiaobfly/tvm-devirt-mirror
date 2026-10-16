@@ -191,7 +191,7 @@ pub fn cmd_cfg(
     Ok(())
 }
 
-/// Dump the VM context so the guest register image can be located.
+/// Show SSA parameters and phi nodes for a recovered function.
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_ssa(
     path: &PathBuf,
