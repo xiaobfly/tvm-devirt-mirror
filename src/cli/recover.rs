@@ -100,6 +100,7 @@ pub fn cmd_cfg(
                 println!("ret to {}", expr::render(&cfg.arena, *dest, 4))
             }
             ir::Terminator::TailCall { target } => println!("tailcall {target:#x}"),
+            ir::Terminator::Trap { text, .. } => println!("trap {text}"),
             ir::Terminator::Unresolved { reason } => println!("UNRESOLVED: {reason}"),
             ir::Terminator::Backedge { target } => println!("backedge -> {target}"),
             ir::Terminator::Adopted { taken, not_taken } => {
@@ -325,6 +326,7 @@ pub fn cmd_lower(
             ir::Terminator::Switch { targets, .. } => println!("    switch {} arms", targets.len()),
             ir::Terminator::Return { .. } => println!("    ret"),
             ir::Terminator::TailCall { target } => println!("    tail {target:#x}"),
+            ir::Terminator::Trap { text, .. } => println!("    trap {text}"),
             ir::Terminator::Backedge { target } => println!("    loop -> {target}"),
             ir::Terminator::Adopted { taken, not_taken } => {
                 println!("    br(adopted) ? {taken} : {not_taken}")

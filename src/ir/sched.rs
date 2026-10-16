@@ -446,6 +446,7 @@ fn successors_of(t: &crate::ir::Terminator) -> Vec<crate::ir::BlockId> {
         }
         Terminator::Return { .. }
         | Terminator::TailCall { .. }
+        | Terminator::Trap { .. }
         | Terminator::Unresolved { .. }
         | Terminator::AdoptedReturn => Vec::new(),
     }
@@ -532,6 +533,7 @@ fn thread_empty_jumps(blocks: &mut [SchedBlock]) {
             }
             Terminator::Return { .. }
             | Terminator::TailCall { .. }
+            | Terminator::Trap { .. }
             | Terminator::Unresolved { .. }
             | Terminator::AdoptedReturn => {}
         }
@@ -689,6 +691,7 @@ fn merge_identical_returns(blocks: &mut [SchedBlock]) {
             }
             Terminator::Return { .. }
             | Terminator::TailCall { .. }
+            | Terminator::Trap { .. }
             | Terminator::Unresolved { .. }
             | Terminator::AdoptedReturn => {}
         }
@@ -1003,7 +1006,7 @@ fn prune_dead_exits(cfg: &Cfg, blocks: &mut [SchedBlock]) {
                 }
             }
 
-            let returns = matches!(b.terminator, Terminator::Return { .. });
+            let returns = matches!(b.terminator, Terminator::Return { .. } | Terminator::Trap { .. });
             let mut in_ = body_reads[i].clone();
             for (r, o) in &blocks[i].exits {
                 if !out.contains(r) {
@@ -1195,7 +1198,7 @@ fn schedule_block(cfg: &Cfg, b: &Block) -> SchedBlock {
         Terminator::Branch { predicate, .. } => Some(s.value(*predicate)),
         Terminator::Switch { selector, .. } => Some(s.value(*selector)),
         // A `ret` reads the return address off the stack itself, so the recovered destination needs no register and no instructions. Scheduling it would make it a DCE root and keep alive a load of the return slot whose result nothing can use.
-        Terminator::Return { .. } => None,
+        Terminator::Return { .. } | Terminator::Trap { .. } => None,
         _ => None,
     };
 

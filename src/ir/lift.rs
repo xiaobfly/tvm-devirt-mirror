@@ -279,6 +279,14 @@ pub enum Stop {
     Return { site: u64, dest: Ref },
     /// Instruction the lifter does not model.
     Unsupported { site: u64, text: String },
+    /// A trap: `int n`, `int3`, `ud2` or `hlt`. The original image ends the guest
+    /// path here, so this is not a recovery failure. `bytes` is the instruction as
+    /// encoded at `site`, kept so the terminator can re-emit it verbatim.
+    Trap {
+        site: u64,
+        text: String,
+        bytes: Vec<u8>,
+    },
     /// Could not read code at the given address.
     Unreadable { site: u64 },
     /// A dispatch destination that repeats closes a loop.
@@ -1497,6 +1505,26 @@ impl<'a> Emulator<'a> {
         self.trace.iter().skip(skip).copied().collect()
     }
 
+    /// Everything a [`Stop::Trap`] needs: the Intel rendering of the instruction
+    /// and the bytes it was encoded with, read back from the image. The bytes are
+    /// what [`crate::ir::Terminator::Trap`] re-emits, so the patched image traps
+    /// exactly where the original did.
+    fn trap_stop(&self, ip: u64, inst: &Instruction) -> Stop {
+        let mut fmt = iced_x86::IntelFormatter::new();
+        let mut text = String::new();
+        iced_x86::Formatter::format(&mut fmt, inst, &mut text);
+        let bytes = self
+            .pe
+            .read_va(ip, inst.len())
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        Stop::Trap {
+            site: ip,
+            text,
+            bytes,
+        }
+    }
+
     pub fn step(&mut self, ip: u64) -> Step {
         let Some(inst) = disasm::decode_at(self.pe, ip) else {
             return Step::Stopped(Stop::Unreadable { site: ip });
@@ -2115,6 +2143,12 @@ impl<'a> Emulator<'a> {
             }
             M::Incsspq | M::Incsspd => Step::Next(next),
 
+            // A trap is the faithful end of the guest path: nothing follows in the
+            // original either, so recovery models it like a return and codegen
+            // re-emits the original bytes. `int 29h` is the common one: TVM's own
+            // not-implemented trap.
+            M::Int | M::Ud2 | M::Hlt => Step::Stopped(self.trap_stop(ip, &inst)),
+
             // TVM ends a guest-exit trampoline with a bare 0xCC:
             //     push qword ptr [rax + 0x80]   ; guest FLAGS
             //     popfq
@@ -2139,10 +2173,9 @@ impl<'a> Emulator<'a> {
                     .read_va(ip.wrapping_sub(4), 4)
                     .is_some_and(|b| b == EXIT_TRAMPOLINE_STACK_PIVOT.as_slice());
                 if !in_exit_trampoline {
-                    return Step::Stopped(Stop::Unsupported {
-                        site: ip,
-                        text: "int3".into(),
-                    });
+                    // Not the exit trampoline's stack pivot: a bare 0xCC is a trap
+                    // (padding, or a deliberate one), and a trap ends the path.
+                    return Step::Stopped(self.trap_stop(ip, &inst));
                 }
                 let dest = self.state.reg(Reg::Rax);
                 // Never fabricate a transfer into a trap byte: a concrete destination

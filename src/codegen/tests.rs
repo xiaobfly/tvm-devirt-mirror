@@ -592,6 +592,58 @@ fn a_tail_call_to_a_retargeted_trampoline_names_the_body() {
     );
 }
 
+/// A trap terminator re-emits the instruction it was recovered from, byte for
+/// byte: the patched image has to trap exactly where the original did, and
+/// nothing after a trap is observable, so no epilogue may follow.
+#[test]
+fn a_trap_terminator_re_emits_its_original_bytes() {
+    let layout = FrameLayout::new(0, 0, false);
+    let alloc = Alloc {
+        segments: Vec::new(),
+        copies: Vec::new(),
+        slots: 0,
+    };
+    let b = SchedBlock {
+        id: BlockId {
+            handler: 0x1000,
+            vip: None,
+        },
+        instrs: Vec::new(),
+        exits: Vec::new(),
+        callee_set: Vec::new(),
+        control: None,
+        terminator: Terminator::Trap {
+            text: "int 29h".into(),
+            bytes: vec![0xCD, 0x29],
+        },
+        fused_cmp: None,
+    };
+    let label_of = HashMap::new();
+    let mut asm = CodeAssembler::new(64).expect("asm");
+    emit_terminator(
+        &mut asm,
+        &alloc,
+        &b,
+        &[],
+        &label_of,
+        &layout,
+        None,
+        &CallRedirects::none(),
+    )
+    .expect("emit");
+    let bytes = asm.assemble(0x140001000).expect("assemble");
+    assert!(
+        bytes.ends_with(&[0xCD, 0x29]),
+        "the trap bytes must be re-emitted verbatim, got {:?}",
+        disasm_bytes(&bytes, 0x140001000)
+    );
+    assert_eq!(
+        disasm_bytes(&bytes, 0x140001000),
+        vec!["int 29h"],
+        "the trap is the whole block: no epilogue may follow it"
+    );
+}
+
 fn seg(item: Item, reg: Reg) -> Segment {
     Segment {
         item,

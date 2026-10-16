@@ -627,6 +627,10 @@ impl<'a> Explorer<'a> {
                     back_edges.push((task.id, id));
                     Terminator::Backedge { target: id }
                 }
+                // A trap ends the guest path in the original too. Nothing after it is
+                // observable, so the block terminates here and the terminator carries
+                // the original bytes for codegen to re-emit.
+                Stop::Trap { text, bytes, .. } => Terminator::Trap { text, bytes },
                 Stop::Unsupported { site, text, .. } => Terminator::Unresolved {
                     reason: format!("unsupported at {site:#x}: {text}"),
                 },
@@ -945,6 +949,12 @@ impl<'a> Explorer<'a> {
             Terminator::TailCall { target } => Some(Terminator::TailCall { target: *target }),
             // The concrete pass ran this block to a return.
             Terminator::Return { .. } => Some(Terminator::AdoptedReturn),
+            // A trap is an exit too: the concrete pass reached it, and re-deriving
+            // the block's symbolic form changes nothing about where it ends.
+            Terminator::Trap { text, bytes } => Some(Terminator::Trap {
+                text: text.clone(),
+                bytes: bytes.clone(),
+            }),
             // Already-adopted terminators cannot appear here: only the concrete
             // pass is consulted, and it never adopts.
             Terminator::Unresolved { .. }
@@ -1339,6 +1349,7 @@ fn stop_kind(stop: &Stop) -> &'static str {
         Stop::NativeBranch { .. } => "NativeBranch",
         Stop::Return { .. } => "Return",
         Stop::Unsupported { .. } => "Unsupported",
+        Stop::Trap { .. } => "Trap",
         Stop::Unreadable { .. } => "Unreadable",
         Stop::Backedge { .. } => "Backedge",
         Stop::Budget { .. } => "Budget",
@@ -1357,6 +1368,7 @@ fn stop_site(stop: &Stop) -> u64 {
         | Stop::NativeBranch { site, .. }
         | Stop::Return { site, .. }
         | Stop::Unsupported { site, .. }
+        | Stop::Trap { site, .. }
         | Stop::Unreadable { site }
         | Stop::Backedge { site, .. }
         | Stop::Budget { site }
@@ -1812,6 +1824,7 @@ pub fn validate(cfg: &Cfg) -> CfgIssues {
             Terminator::Return { .. }
                 | Terminator::AdoptedReturn
                 | Terminator::TailCall { .. }
+                | Terminator::Trap { .. }
                 | Terminator::Unresolved { .. }
         ) {
             exits.push(b.id);
@@ -2129,6 +2142,73 @@ mod dom_tests {
             vec![id(2), id(3)],
             "a hanging arm must be flagged even when another arm returns"
         );
+    }
+
+    /// A trap ends the function, so a graph whose only way out is a trap is clean.
+    /// The same graph with the trap replaced by a closed loop must still be flagged:
+    /// without that half, a `validate` that had stopped checking exits at all would
+    /// pass this test.
+    #[test]
+    fn a_trap_is_an_exit_for_validation() {
+        let graph = |last: Terminator| {
+            let mut arena = Arena::default();
+            let pred = arena.init_reg(Reg::Rax);
+            let mut blocks = vec![
+                blk(0, vec![], Terminator::Jump(id(1))),
+                blk(
+                    1,
+                    vec![id(0), id(2), id(3)],
+                    Terminator::Branch {
+                        predicate: pred,
+                        taken: id(2),
+                        not_taken: id(3),
+                    },
+                ),
+                blk(2, vec![id(1)], Terminator::Backedge { target: id(1) }),
+                blk(3, vec![id(1)], last),
+            ];
+            blocks.sort_by_key(|b| b.id);
+            Cfg {
+                entry: id(0),
+                arena,
+                blocks,
+                total_steps: 0,
+                unresolved: 0,
+                back_edges: Vec::new(),
+                trivial_phis_removed: 0,
+                timed_out: false,
+                stack_base: STACK_BASE,
+                vm_range: (0, 0),
+            }
+        };
+
+        // `int 29h` is the trap the sample hits, so the terminator carries exactly
+        // the bytes recovery reads out of the image.
+        let trapped = graph(Terminator::Trap {
+            text: "int 29h".into(),
+            bytes: vec![0xCD, 0x29],
+        });
+        let issues = validate(&trapped);
+        assert!(
+            issues.cannot_reach_exit.is_empty(),
+            "a trap ends the function, so every block reaches an exit: {:?}",
+            issues.cannot_reach_exit
+        );
+        assert!(
+            issues.is_clean(),
+            "a trap-only graph is otherwise well formed: {}",
+            issues.summary()
+        );
+
+        // Closed instead of trapped: block 3 loops back, so nothing can ever leave.
+        let looping = graph(Terminator::Backedge { target: id(1) });
+        let issues = validate(&looping);
+        assert_eq!(
+            issues.cannot_reach_exit.len(),
+            4,
+            "a graph that still cannot terminate must keep being flagged"
+        );
+        assert!(!issues.is_clean());
     }
 
     #[test]

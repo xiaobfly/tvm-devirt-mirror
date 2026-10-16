@@ -376,6 +376,15 @@ pub(crate) fn emit_terminator(
                 );
             }
         }
+        Terminator::Trap { text, bytes } => {
+            // Execution ends here, exactly as it did in the original image: the trap
+            // instruction goes out verbatim and no epilogue runs. Nothing after a
+            // trap is observable, so there is no caller state to restore.
+            if bytes.is_empty() {
+                bail!("trap at {:?} ({text}) has no recorded bytes", b.id);
+            }
+            asm.db(bytes)?;
+        }
         Terminator::AdoptedReturn => {
             // The concrete pass proved this block returns, but the symbolic
             // pass could not derive the return value expression.  Emit the

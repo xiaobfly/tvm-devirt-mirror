@@ -35,6 +35,9 @@ pub fn describe_stop(emu: &lift::Emulator, stop: &lift::Stop) -> String {
         lift::Stop::Unsupported { site, text, .. } => {
             format!("unsupported instruction at {site:#x}: {text}")
         }
+        lift::Stop::Trap { site, text, .. } => {
+            format!("trap instruction at {site:#x}: {text}")
+        }
         lift::Stop::Unreadable { site } => format!("unreadable code at {site:#x}"),
         lift::Stop::Backedge { site, target, .. } => {
             format!("loop back edge at {site:#x} -> {target:#x}")

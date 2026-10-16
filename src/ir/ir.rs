@@ -42,6 +42,11 @@ pub enum Terminator {
     Return { dest: Ref },
     /// Control left the function to a concrete address.
     TailCall { target: u64 },
+    /// The guest executed a trap (`int n`, `int3`, `ud2`, `hlt`): execution ends
+    /// here, exactly as it did in the original image. `bytes` is the trap
+    /// instruction and is re-emitted verbatim, so the patched image traps at the
+    /// same point the original did.
+    Trap { text: String, bytes: Vec<u8> },
     /// Recovery failed here.
     Unresolved { reason: String },
     /// Loop back edge to an already-recovered block.
@@ -318,6 +323,7 @@ pub fn terminator_kind(t: &Terminator) -> &'static str {
         Terminator::Switch { .. } => "switch",
         Terminator::Return { .. } => "return",
         Terminator::TailCall { .. } => "tailcall",
+        Terminator::Trap { .. } => "trap",
         Terminator::Unresolved { .. } => "unresolved",
         Terminator::Backedge { .. } => "backedge",
         Terminator::Adopted { .. } => "branch (edges only)",
