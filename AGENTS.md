@@ -56,7 +56,7 @@ tvm-devirt cfg    <input> <va> [--events] [--state] [--steps N] [--max-blocks N]
 tvm-devirt ssa    <input> <va> [--joins-only]
 tvm-devirt lower  <input> <va>
 tvm-devirt devirt <input> <va> [--output file.bin] [--dis]
-tvm-devirt write-devirt <input> <output> [--jobs N] [--steps N] [--timeout S]
+tvm-devirt write-devirt <input> <output> [--jobs N] [--steps N] [--timeout S] [--max-blocks N]
 ```
 
 Also `info`, `dis --count N`, `vmctx --window N`. `--vm-section` (default `.tvm0`) exists on `info`, `entries`, `cfg`, `ssa`, `lower`, `write-devirt` only; `--stack-base` defaults to `0x7fff_fffe_fda0`; VAs accept `0x` prefixes.
@@ -100,11 +100,11 @@ Also `info`, `dis --count N`, `vmctx --window N`. `--vm-section` (default `.tvm0
 
 ## Testing & QA
 
-- Framework: plain `#[cfg(test)] mod tests` in-module (Rust's built-in harness). `cargo test` needs no external fixtures and runs 186 tests in well under a second.
+- Framework: plain `#[cfg(test)] mod tests` in-module (Rust's built-in harness). `cargo test` needs no external fixtures and runs 187 tests in well under a second.
 - Coverage is concentrated in the IR and codegen layers: `src/codegen/tests.rs` (child module declared at `codegen/mod.rs:26`, reaches private emitters), `src/ir/expr.rs`, `src/ir/lift.rs`, `src/ir/sched.rs`, `src/ir/regalloc.rs`, `src/vm/explore.rs`, `src/vm/state.rs`.
-- **Untested**: `src/main.rs`, all of `src/cli/`, `src/binary/` (PE parsing/writeback), `src/vm/discover.rs`, `src/ir/hash.rs`. Changes there need a manual smoke run against `test/ACE-SSC-DRV64.sys`.
+- **Untested**: `src/main.rs`, all of `src/cli/`, PE parsing and patch building in `src/binary/` (`why_incomplete` is the only tested item there), `src/vm/discover.rs`, `src/ir/hash.rs`. Changes there need a manual smoke run against `test/ACE-SSC-DRV64.sys`.
 - Test naming is sentence-style snake_case describing the bug prevented, e.g. `a_spill_store_no_one_reads_is_removed` (`codegen/tests.rs:148`).
 - Assertions are text/structural, not golden files: `codegen/tests.rs` assembles with `CodeAssembler` and compares `NasmFormatter` output via helpers `emit_one`, `seg`, `disasm_bytes`; IR tests build synthetic PEs with `executable_pe` / `pe_with` (`ir/lift.rs:3085`, `:3322`).
 - Test-only helpers inside production modules are `#[cfg(test)]`-gated — keep them that way.
 - Smoke paths verified against the bundled sample: `entries` reports `discovered 338 virtualized functions`; `cfg`/`lower` recover 18 blocks (126 instructions) at `0x140001000`; `devirt` emits x86 for it. Use these to check a change end-to-end.
-- Full-pipeline check: `cargo run -- write-devirt test/ACE-SSC-DRV64.sys out.sys --jobs 8 --timeout 30` retargets 312 of 338 functions (26 fail with per-function reasons: `N block(s) never resolved`, `CFG invariant: cannot_reach_exit|unidentified`) and writes a patched image in ~85 s. A worker panic there means an SSA-scoping regression — that is what `src/ir/sched.rs:291-296` exists to catch; never delete the assertion.
+- Full-pipeline check: `cargo run -- write-devirt test/ACE-SSC-DRV64.sys out.sys --jobs 8 --timeout 30` retargets 312 of 338 functions in ~85 s and writes a patched image. `--max-blocks 1024` gets 315: the trampolines `0x14000a9e0`, `0x14000aa40` and `0x14000b681` share VM entry `0x14008b459`, which recovers 689 blocks against a default budget of 512 (`prepare_one` in `src/binary/writeback.rs`). The remaining failures are named by `why_incomplete` — `unsupported at …: int 29h` / `int3` traps, `left image at …`, `unresolved branch at … (0 candidates)`, `block budget reached`, `CFG invariant: cannot_reach_exit|unidentified`. A worker panic there means an SSA-scoping regression — that is what `src/ir/sched.rs:291-296` exists to catch; never delete the assertion.
