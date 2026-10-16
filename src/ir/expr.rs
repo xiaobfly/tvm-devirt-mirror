@@ -245,6 +245,57 @@ pub struct Node {
     pub width: Width,
 }
 
+/// How an [`Arena`] is distributed across node kinds, widths and in-edges.
+#[derive(Debug, Clone, Default)]
+pub struct Composition {
+    pub total: usize,
+    /// Node count per kind, largest first.
+    pub by_kind: Vec<(String, usize)>,
+    /// Node count per bit width, largest first.
+    pub by_width: Vec<(String, usize)>,
+    /// Total parent edges. A tree of `total` nodes has `total - 1`; anything much
+    /// larger means nodes are reused rather than rebuilt.
+    pub edges: usize,
+    /// Nodes with two or more parents.
+    pub shared: usize,
+    pub max_indegree: usize,
+    /// The most-referenced nodes, rendered shallowly, with their in-degrees.
+    pub top_shared: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NodeKind {
+    Const,
+    InitReg,
+    Load,
+    Bin(BinOp),
+    Un(UnOp),
+    Zext,
+    Sext,
+    Trunc,
+    Select,
+    Opaque(&'static str),
+    Param,
+}
+
+impl NodeKind {
+    fn label(self) -> String {
+        match self {
+            Self::Const => "const".to_string(),
+            Self::InitReg => "init_reg".to_string(),
+            Self::Load => "load".to_string(),
+            Self::Bin(op) => format!("bin:{}", op.symbol()),
+            Self::Un(op) => format!("un:{op:?}"),
+            Self::Zext => "zext".to_string(),
+            Self::Sext => "sext".to_string(),
+            Self::Trunc => "trunc".to_string(),
+            Self::Select => "select".to_string(),
+            Self::Opaque(tag) => format!("opaque:{tag}"),
+            Self::Param => "param".to_string(),
+        }
+    }
+}
+
 /// Hash-consing arena. All expression construction goes through here so that
 /// structural equality is pointer equality. Cloning omits memo caches because they
 /// are derived from immutable nodes.
@@ -317,16 +368,113 @@ impl Arena {
         Self::default()
     }
 
+    /// How the arena is distributed, for diagnosing runaway growth.
+    ///
+    /// Counting by node kind says where the mass is. Counting in-edges says whether that
+    /// mass is *shared* or *duplicated*, which is the difference between an expression
+    /// that is merely large and one that has been rebuilt from scratch at every step.
+    pub fn composition(&self) -> Composition {
+        let n = self.nodes.len();
+        let mut indeg = vec![0u32; n];
+        let mut kinds: std::collections::HashMap<NodeKind, usize> =
+            std::collections::HashMap::new();
+        let mut widths: std::collections::HashMap<&'static str, usize> =
+            std::collections::HashMap::new();
+        for node in &self.nodes {
+            let kind = match &node.op {
+                Op::Const(_) => NodeKind::Const,
+                Op::InitReg(_) => NodeKind::InitReg,
+                Op::Load(_, _) => NodeKind::Load,
+                Op::Bin(op, _, _) => NodeKind::Bin(*op),
+                Op::Un(op, _) => NodeKind::Un(*op),
+                Op::Zext(_) => NodeKind::Zext,
+                Op::Sext(_) => NodeKind::Sext,
+                Op::Trunc(_) => NodeKind::Trunc,
+                Op::Select(_, _, _) => NodeKind::Select,
+                Op::Opaque(tag, _) => NodeKind::Opaque(tag),
+                Op::Param(_, _) => NodeKind::Param,
+            };
+            *kinds.entry(kind).or_default() += 1;
+            *widths
+                .entry(match node.width {
+                    Width::W8 => "w8",
+                    Width::W16 => "w16",
+                    Width::W32 => "w32",
+                    Width::W64 => "w64",
+                })
+                .or_default() += 1;
+            let mut bump = |r: Ref| {
+                if let Some(slot) = indeg.get_mut(r.index()) {
+                    *slot += 1;
+                }
+            };
+            match &node.op {
+                Op::Bin(_, x, y) => {
+                    bump(*x);
+                    bump(*y);
+                }
+                Op::Un(_, x) | Op::Zext(x) | Op::Sext(x) | Op::Trunc(x) => bump(*x),
+                Op::Load(a, _) => bump(*a),
+                Op::Select(c, x, y) => {
+                    bump(*c);
+                    bump(*x);
+                    bump(*y);
+                }
+                _ => {}
+            }
+        }
+
+        // The most-referenced nodes, rendered shallowly: a subtree that half the DAG
+        // points at is the thing a rewrite would have to share or eliminate.
+        let mut by_indeg: Vec<(usize, u32)> = Vec::with_capacity(6);
+        for (index, degree) in indeg.iter().copied().enumerate().filter(|(_, d)| *d >= 2) {
+            if by_indeg.len() < 6 {
+                by_indeg.push((index, degree));
+                continue;
+            }
+            let (smallest, _) = by_indeg
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (index, degree))| (*degree, std::cmp::Reverse(*index)))
+                .unwrap();
+            if degree > by_indeg[smallest].1 {
+                by_indeg[smallest] = (index, degree);
+            }
+        }
+        by_indeg.sort_by_key(|(index, degree)| (std::cmp::Reverse(*degree), *index));
+        let top_shared: Vec<(String, usize)> = by_indeg
+            .into_iter()
+            .map(|(index, degree)| (render(self, Ref::from_index(index), 3), degree as usize))
+            .collect();
+
+        let mut by_kind: Vec<(String, usize)> = kinds
+            .into_iter()
+            .map(|(kind, count)| (kind.label(), count))
+            .collect();
+        by_kind.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut by_width: Vec<(String, usize)> = widths
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        by_width.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+
+        Composition {
+            total: n,
+            by_kind,
+            by_width,
+            edges: indeg.iter().map(|v| *v as usize).sum(),
+            shared: indeg.iter().filter(|v| **v >= 2).count(),
+            max_indegree: indeg.iter().copied().max().unwrap_or(0) as usize,
+            top_shared,
+        }
+    }
+
     /// Number of distinct nodes reachable from the roots, following operand edges.
     ///
     /// The arena never reclaims anything, so its length counts nodes *created*, not nodes
     /// still in use. A machine that writes a fresh opaque value into a register or a flag on
     /// every step makes those two numbers diverge enormously, and only the second is what a
     /// folding limit should be measuring. Reachability from the live roots is that number.
-    ///
-    /// Only the tests need this today: nothing on the recovery path calls it, so it is
-    /// compiled for test builds alone rather than left as a dead-code warning.
-    #[cfg(test)]
     pub fn reachable_from(&self, roots: &[Ref]) -> usize {
         let mut seen = vec![false; self.nodes.len()];
         let mut stack: Vec<Ref> = roots.to_vec();
@@ -1662,11 +1810,14 @@ impl Arena {
                 if self.is_complement(a, b) {
                     return Some(self.constant(mask, width));
                 }
-                // (A | c1) ^ c2 where c1 & c2 == c1 -> A ^ (c1 ^ c2)
-                // This helps flatten nested constants in XOR chains
+                // Forced OR bits must first be cleared from A before merging
+                // XOR constants: (A|c1)^c2 = (A & ~c1) ^ (c1^c2).
+                // Omitting the mask restores A's overlapping bits and is wrong.
                 if let (Some(c2), Some((BinOp::Or, x, y))) = (cb, self.as_bin(a)) {
                     if let Some(c1) = self.as_const(y) {
-                        if (c1 & c2) == c1 {
+                        if (c1 & c2) == c1 && self.width(x) == width {
+                            let clear = self.constant(mask ^ c1, width);
+                            let x = self.bin(BinOp::And, x, clear);
                             let k = self.constant(c1 ^ c2, width);
                             return Some(self.bin(BinOp::Xor, x, k));
                         }
@@ -2241,8 +2392,89 @@ pub fn render(a: &Arena, r: Ref, max_depth: u32) -> String {
 }
 
 #[cfg(test)]
+mod composition_tests {
+    use super::*;
+
+    /// Sharing is what the in-edge counts are for: a DAG that reuses a subtree has
+    /// more edges than a tree of the same size, and the diagnostic has to show that,
+    /// because it is the difference between a large expression and a rebuilt one.
+    #[test]
+    fn a_shared_subtree_shows_up_as_extra_edges() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rax);
+        let one = a.constant(1, Width::W64);
+        // Two parents for the same node.
+        let s = a.bin(BinOp::Add, x, one);
+        let t = a.bin(BinOp::Xor, x, one);
+        let top = a.bin(BinOp::Or, s, t);
+        let c = a.composition();
+
+        assert_eq!(c.total, a.len());
+        assert_eq!(c.total, 5, "x, 1, add, xor, or");
+        assert!(
+            c.edges > c.total - 1,
+            "edges {} vs tree {}",
+            c.edges,
+            c.total - 1
+        );
+        // Only the two leaves have two parents; the three bin nodes have one each.
+        assert_eq!(c.shared, 2);
+        assert_eq!(c.max_indegree, 2);
+        let kinds: Vec<&str> = c.by_kind.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(kinds.contains(&"bin:+"), "{kinds:?}");
+        assert!(kinds.contains(&"init_reg"), "{kinds:?}");
+        assert!(!c.top_shared.is_empty(), "a shared node must be listed");
+        let _ = top;
+    }
+
+    /// Reachability is what separates nodes still in use from nodes merely still
+    /// allocated, which is the distinction the folding limit should be measuring.
+    #[test]
+    fn reachability_ignores_nodes_nothing_points_at() {
+        let mut a = Arena::new();
+        let x = a.init_reg(Reg::Rax);
+        let one = a.constant(1, Width::W64);
+        let live = a.bin(BinOp::Add, x, one);
+        // The shape a clobber-on-every-step machine produces: allocated, unreferenced.
+        let _dead = a.opaque("clobbered", Width::W64);
+        let _dead2 = a.opaque("flag", Width::W8);
+        assert_eq!(a.len(), 5);
+        assert_eq!(a.reachable_from(&[live]), 3, "x, 1 and the add");
+        assert_eq!(a.reachable_from(&[]), 0);
+    }
+
+    /// A degenerate arena still reports a coherent composition rather than panicking.
+    #[test]
+    fn an_empty_arena_is_described() {
+        let a = Arena::new();
+        let c = a.composition();
+        assert_eq!(c.total, 0);
+        assert_eq!(c.edges, 0);
+        assert_eq!(c.shared, 0);
+        assert!(c.by_kind.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xor_of_forced_bits_never_restores_overlapping_input_bits() {
+        for w in [Width::W8, Width::W16, Width::W32, Width::W64] {
+            let mut a = Arena::new();
+            let raw = a.init_reg(Reg::Rcx);
+            let x = a.trunc(raw, w);
+            let forced = a.constant(0x40, w);
+            let packed = a.bin(BinOp::Or, x, forced);
+            let toggled = a.constant(0x60, w);
+            let result = a.bin(BinOp::Xor, packed, toggled);
+            for v in [0u64, 0x40, 0x46, w.mask()] {
+                let env = HashMap::from([(Reg::Rcx, v)]);
+                assert_eq!(eval(&a, result, &env), ((v | 0x40) ^ 0x60) & w.mask());
+            }
+        }
+    }
 
     fn sym(a: &mut Arena, name: Reg) -> Ref {
         a.init_reg(name)
@@ -2780,10 +3012,10 @@ mod tests {
         let y = a.init_reg(Reg::Rbx);
         let sum = a.bin(BinOp::Add, x, y);
 
-        // Retaining `y` first deliberately reverses the two leaf indices in
-        // the compacted arena. The existing sum must follow the new canonical
-        // Ref order or a later construction of the same expression will no
-        // longer hash-cons to it.
+        // Retaining `y` first changes the DFS visitation order without changing
+        // the old Ref order. Compaction must preserve that relative ordering or
+        // a later construction of the same expression will not hash-cons to
+        // the retained sum.
         let remap = a.compact(&[y, sum]);
         let rebuilt = a.bin(BinOp::Add, remap[&x], remap[&y]);
 

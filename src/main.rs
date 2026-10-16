@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use cli::diag::cmd_unresolved;
 use cli::emit::{cmd_devirt, cmd_write_devirt};
 use cli::inspect::{cmd_dis, cmd_entries, cmd_info, cmd_trace, cmd_vmctx};
 use cli::recover::{cmd_cfg, cmd_lower, cmd_ssa};
@@ -38,6 +39,15 @@ enum Cmd {
         /// Print all entries instead of a summary.
         #[arg(long)]
         all: bool,
+        /// Also list int3 / __fastfail stubs. Restores the old census, which
+        /// counted every trampoline-shaped location.
+        #[arg(long)]
+        include_stubs: bool,
+        /// Also drop locations flagged by shape alone (an E9 into the VM
+        /// section with no int3 tail). Off by default: that is a shape
+        /// judgement, not proof, and ACE-Tray's recoverable entry has it.
+        #[arg(long)]
+        aggressive_shape_filter: bool,
     },
     /// Linear disassembly at a virtual address
     Dis {
@@ -83,8 +93,9 @@ enum Cmd {
         /// Per-path instruction budget.
         #[arg(long, default_value_t = 400_000)]
         steps: usize,
-        /// Maximum blocks to recover.
-        #[arg(long, default_value_t = 512)]
+        /// Maximum blocks to recover. Raising it recovers more of a large
+        /// function; blocks past the budget are reported as truncated, not failed.
+        #[arg(long, default_value_t = vm::explore::DEFAULT_BLOCK_BUDGET)]
         max_blocks: usize,
         /// Print each recovered block's guest events.
         #[arg(long)]
@@ -159,15 +170,16 @@ enum Cmd {
         /// Wall-clock backstop per function.
         #[arg(long, default_value_t = 600)]
         timeout: u64,
-        /// Maximum blocks to recover per function.
-        #[arg(long, default_value_t = 512)]
-        max_blocks: usize,
         /// Section holding VM bytecode.
         #[arg(long, default_value = vm::DEFAULT_VM_SECTION)]
         vm_section: String,
         /// Functions to recover concurrently. Defaults to `min(cores, 8)`.
         #[arg(long)]
         jobs: Option<usize>,
+        /// Maximum blocks to recover per function. Blocks past the budget are
+        /// reported as truncated rather than as recovery failures.
+        #[arg(long, default_value_t = vm::explore::DEFAULT_BLOCK_BUDGET)]
+        max_blocks: usize,
     },
     /// Devirtualize one function into x86 machine code.
     Devirt {
@@ -180,11 +192,37 @@ enum Cmd {
         stack_base: u64,
         #[arg(long, default_value_t = 400_000)]
         steps: usize,
+        /// Maximum blocks to recover. 512 is the historical default and is kept:
+        /// raising it changes what the emitted function covers.
+        #[arg(long, default_value_t = 512)]
+        max_blocks: usize,
         #[arg(long, default_value_t = 120)]
         timeout: u64,
         /// Disassemble the emitted bytes after encoding.
         #[arg(long)]
         dis: bool,
+    },
+    /// Per-block diagnostics for a function whose recovery did not close.
+    Unresolved {
+        input: PathBuf,
+        #[arg(value_parser = parse_u64)]
+        va: u64,
+        #[arg(long, value_parser = parse_u64, default_value_t = vm::DEFAULT_STACK_BASE)]
+        stack_base: u64,
+        /// Instruction step budget, set to match the run being diagnosed.
+        #[arg(long, default_value_t = 400_000)]
+        steps: usize,
+        /// Maximum blocks to recover. The devirtualizer's own default is 512, and
+        /// it is kept here so that diagnosing the baseline measures the baseline.
+        /// Raising it is the point of an experiment, not of a comparison.
+        #[arg(long, default_value_t = 512)]
+        max_blocks: usize,
+        /// Wall-clock limit in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Write the JSON here instead of stdout.
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
 }
 
@@ -205,7 +243,15 @@ fn main() -> Result<()> {
             input,
             vm_section,
             all,
-        } => cmd_entries(&input, &vm_section, all),
+            include_stubs,
+            aggressive_shape_filter,
+        } => cmd_entries(
+            &input,
+            &vm_section,
+            all,
+            include_stubs,
+            aggressive_shape_filter,
+        ),
         Cmd::Dis { input, va, count } => cmd_dis(&input, va, count),
         Cmd::Trace {
             input,
@@ -271,17 +317,17 @@ fn main() -> Result<()> {
             output,
             steps,
             timeout,
-            max_blocks,
             vm_section,
             jobs,
+            max_blocks,
         } => cmd_write_devirt(
             &input,
             &output,
             steps,
             timeout,
-            max_blocks,
             &vm_section,
             jobs,
+            max_blocks,
         ),
         Cmd::Devirt {
             input,
@@ -289,6 +335,7 @@ fn main() -> Result<()> {
             output,
             stack_base,
             steps,
+            max_blocks,
             timeout,
             dis,
         } => cmd_devirt(
@@ -297,6 +344,7 @@ fn main() -> Result<()> {
             output.as_deref(),
             stack_base,
             steps,
+            max_blocks,
             timeout,
             dis,
         ),
@@ -316,6 +364,23 @@ fn main() -> Result<()> {
             max_blocks,
             timeout,
             &vm_section,
+        ),
+        Cmd::Unresolved {
+            input,
+            va,
+            stack_base,
+            steps,
+            max_blocks,
+            timeout,
+            json,
+        } => cmd_unresolved(
+            &input,
+            va,
+            stack_base,
+            steps,
+            max_blocks,
+            timeout,
+            json.as_deref(),
         ),
     }
 }

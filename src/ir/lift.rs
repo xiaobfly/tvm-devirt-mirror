@@ -290,12 +290,26 @@ pub enum Stop {
     /// Step budget exhausted.
     Budget { site: u64 },
     /// The recovery wall clock ran out inside this block.
+    ///
+    /// Not a variant of [`Stop::Budget`]: the step budget is a deterministic limit on
+    /// one block, while this says the run stopped at a point that depends on machine
+    /// load, so the block was abandoned part way rather than finished.
     Deadline { site: u64 },
     /// The expression DAG grew past its limit, which means folding has broken
     /// down and further evaluation would only produce garbage.
     Diverged { site: u64, nodes: usize },
     /// Reached an address outside the image.
     OutOfImage { site: u64 },
+    /// A computed jump that folded to a concrete address that is not executable
+    /// code.
+    ///
+    /// This is the same situation [`Stop::OutOfImage`] reports, except that it is
+    /// raised *at the jump* while the destination expression still exists.
+    /// `run` can only look at the next instruction pointer, and by then the
+    /// expression that produced it is gone, so diagnostics are left with a bare
+    /// number. Carrying the expression here preserves why the jump failed without
+    /// claiming that another forced pin makes the observed outcome unreachable.
+    BadTarget { site: u64, dest: Ref, target: u64 },
     /// A call to a routine that never returns. The block ends at the call.
     NoReturn { site: u64 },
 }
@@ -384,18 +398,29 @@ pub struct Emulator<'a> {
     /// the base, since the two are only meaningful together.
     pub guest_layout: Option<Layout>,
     pub vip_slot: Option<u64>,
-    /// Wall-clock limit shared by every evaluator fork in one recovery pass.
+    /// Wall-clock limit for the recovery pass this evaluator belongs to, when the
+    /// caller set one. Forks inherit it, so every block is charged against the same
+    /// clock.
     pub deadline: Option<RecoveryDeadline>,
 }
 
 /// A wall-clock limit shared by every fork of one recovery pass.
+///
+/// Recovery used to consult the clock only between blocks, so one block that keeps
+/// making progress past the deadline -- a long straight-line handler chain, or a
+/// folding path whose per-instruction cost is large -- could overshoot it for as long
+/// as its step budget allowed. Carrying the limit into the evaluator lets the
+/// instruction loop notice instead.
 #[derive(Clone, Copy, Debug)]
 pub struct RecoveryDeadline {
-    started: std::time::Instant,
-    budget: std::time::Duration,
+    /// When the pass started.
+    pub started: std::time::Instant,
+    /// Time the pass is allowed.
+    pub budget: std::time::Duration,
 }
 
 impl RecoveryDeadline {
+    /// Start charging against `budget` from now.
     pub fn starting_now(budget: std::time::Duration) -> Self {
         Self {
             started: std::time::Instant::now(),
@@ -403,12 +428,31 @@ impl RecoveryDeadline {
         }
     }
 
+    /// Time charged against the budget so far.
+    ///
+    /// Diagnostic-only work is excluded, exactly as the between-block check excludes
+    /// it: a diagnostic run must observe the same recovery an ordinary run would, so
+    /// its own DAG walks and candidate probes cannot be what pushes a block past the
+    /// deadline.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started
+            .elapsed()
+            .saturating_sub(crate::vm::diag::excluded_time())
+    }
+
     pub fn expired(&self) -> bool {
-        self.started.elapsed() >= self.budget
+        self.elapsed() >= self.budget
     }
 }
 
-/// Instructions between wall-clock checks inside the evaluator loop.
+/// Instructions between wall-clock checks inside the evaluator's loop.
+///
+/// The clock is read once per this many instructions rather than every instruction:
+/// `Instant::now` is not free, and a block that is slow because each instruction is
+/// expensive (which is what makes a single block overshoot at all) reaches a check
+/// after a correspondingly long step anyway. 4096 keeps the cost under a tenth of a
+/// percent of an ordinary instruction and bounds the overshoot to a few thousand
+/// steps' worth of work.
 const DEADLINE_CHECK_INTERVAL: usize = 4096;
 
 /// Recursive expression analyses still used by instruction folding must remain
@@ -466,6 +510,8 @@ impl<'a> Emulator<'a> {
             // a wrong constant would degenerate `(handler, vip)` to `handler` and
             // close back edges that do not exist.
             vip_slot: None,
+            // No wall-clock limit until a recovery pass asks for one, so the
+            // inspection commands keep behaving exactly as before.
             deadline: None,
             noreturn_slots: noreturn_import_slots(pe),
             import_slots: pe.imports().into_iter().map(|(slot, _, _)| slot).collect(),
@@ -495,7 +541,55 @@ impl<'a> Emulator<'a> {
         if !matches!(self.arena.op(*expr), Op::Param(..)) {
             return None;
         }
-        self.pins.iter().find(|(r, _)| r == expr).map(|(_, c)| *c)
+        first_pin(&self.pins, *expr)
+    }
+
+    /// Fold `r` with `cand` forced to `value`, taking precedence over any pin the state
+    /// already carries for it.
+    ///
+    /// `pins` is a list searched front to back and substitution takes the first match, so
+    /// appending a second entry for a candidate that is already pinned leaves the older
+    /// value in force. Asking what a *different* value would produce therefore needs the
+    /// old entry removed, not merely shadowed by a later one. Everything derived that the
+    /// substitution touches is restored before returning, so this is a query and not a
+    /// state change.
+    ///
+    /// Returns the folded destination, and the block identity the state would resume at.
+    pub fn probe_pin(&mut self, cand: Ref, value: u64, r: Ref) -> (Option<u64>, Option<u64>) {
+        let saved_pins = self.pins.clone();
+        let saved_watermark = self.memo_pin_count;
+        self.pins.retain(|(p, _)| *p != cand);
+        self.pins.push((cand, value));
+        let target = self.fold_now(r);
+        let vip = self.current_vip();
+        self.pins = saved_pins;
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = saved_watermark;
+        (target, vip)
+    }
+
+    /// Fold `r` with `cand = value` appended to the pin list, which is what a split attempt
+    /// does. Kept beside [`Self::probe_pin`] so the two can be compared: when they disagree,
+    /// an older pin for the same candidate was silently the one in force.
+    pub fn probe_pin_appended(&mut self, cand: Ref, value: u64, r: Ref) -> Option<u64> {
+        let saved_watermark = self.memo_pin_count;
+        self.pins.push((cand, value));
+        let target = self.fold_now(r);
+        self.pins.pop();
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = saved_watermark;
+        target
+    }
+
+    /// Substitute `r` under the current pin set and return the constant it folded to.
+    fn fold_now(&mut self, r: Ref) -> Option<u64> {
+        self.subst_memo.clear();
+        self.pin_dep.clear();
+        self.memo_pin_count = self.pins.len();
+        let folded = self.substitute(r);
+        self.arena.as_const(folded)
     }
 
     pub fn current_vip(&self) -> Option<u64> {
@@ -694,9 +788,12 @@ impl<'a> Emulator<'a> {
             if rsp_ok && score >= MIN_CONTEXT_SCORE && best.is_none_or(|(b, _)| score > b) {
                 best = Some((score, base));
             }
-            // `hi` saturates at the top of the address space. Stop when advancing
-            // the aligned probe would wrap to zero instead of scanning from the
-            // bottom of the address space indefinitely.
+            // The window is `[rbp - 0x40, rbp + 0x200)`, so at most 0x240/8 probes.
+            // `hi` saturates at the top of the address space, though, and an RBP near
+            // it makes `base + 8` wrap to zero -- at which point `base < hi` is still
+            // true and the scan walks the whole 2^61 steps of the address space one
+            // qword at a time while holding the only thread. Wrapping is simply the
+            // end of the window.
             let Some(next) = base.checked_add(8) else {
                 break;
             };
@@ -1861,11 +1958,26 @@ impl<'a> Emulator<'a> {
                         }
                     }
                 }
-                let dest = self.read_op(&inst, 0);
-                let dest = self.substitute(dest);
+                // Kept alongside the substituted form: `substitute` is what folds
+                // the dispatch address down, so if the fold lands somewhere that
+                // is not code, this is the only copy that still shows why.
+                let raw_dest = self.read_op(&inst, 0);
+                let dest = self.substitute(raw_dest);
                 match self.arena.as_const(dest) {
                     Some(t) => {
-                        // A resolved indirect jump is a VM handler transition.
+                        // A resolved indirect jump is a VM handler transition only
+                        // when it actually lands on code. A destination
+                        // that folds to something outside the image (the VM's own
+                        // image base is the value this usually produces) would end
+                        // the block one iteration later as `OutOfImage`, with no
+                        // expression left to split on.
+                        if !self.pe.is_executable(t) {
+                            return Step::Stopped(Stop::BadTarget {
+                                site: ip,
+                                dest: raw_dest,
+                                target: t,
+                            });
+                        }
                         self.dispatches.push((ip, t));
                         // Reaching the identity of an already-recovered block
                         // closes a loop. Stopping keeps cost linear in the
@@ -2144,7 +2256,7 @@ impl<'a> Emulator<'a> {
             memo.insert(r, r);
             return r;
         }
-        if let Some(&(_, v)) = self.pins.iter().find(|(p, _)| *p == r) {
+        if let Some(v) = first_pin(&self.pins, r) {
             let w = self.arena.width(r);
             let k = self.arena.constant(v, w);
             memo.insert(r, k);
@@ -2645,8 +2757,13 @@ impl<'a> Emulator<'a> {
     ) -> Stop {
         let mut ip = start;
         for i in 0..budget {
+            // The step budget is the deterministic limit on this block and normally
+            // the one that fires. The wall clock is checked here as well because a
+            // single block can outlast the whole recovery budget, and the caller's
+            // between-block check cannot see that until the block returns.
             if i % DEADLINE_CHECK_INTERVAL == 0
-                && self.deadline.is_some_and(|deadline| deadline.expired())
+                && let Some(deadline) = self.deadline
+                && deadline.expired()
             {
                 return Stop::Deadline { site: ip };
             }
@@ -2654,7 +2771,14 @@ impl<'a> Emulator<'a> {
                 return Stop::OutOfImage { site: ip };
             }
             if self.arena.len() > self.node_limit {
-                let (_, live, max_depth) = self.compact_arena(retained);
+                let (before, live, max_depth) = self.compact_arena(retained);
+                crate::vm::diag::record_compaction(crate::vm::diag::CompactionDiag {
+                    site: ip,
+                    before,
+                    after: live,
+                    max_depth,
+                    ..Default::default()
+                });
                 if live > self.node_limit || max_depth > MAX_SAFE_LIVE_DAG_DEPTH {
                     return Stop::Diverged {
                         site: ip,
@@ -2939,6 +3063,16 @@ fn pick_vip_slot(seen: &HashMap<u64, HashSet<u64>>) -> Option<u64> {
         .map(|(off, _)| *off)
 }
 
+/// The value a pin set gives a node, if any.
+///
+/// First match wins, which is what makes appending a second pin for a node a no-op: the
+/// older entry is still found first. A caller that means to *change* a pinned value has
+/// to remove the old entry, not push another one; `Emulator::probe_pin` does exactly
+/// that, and `probe_pin_appended` exists so the two behaviours can be compared.
+fn first_pin(pins: &[(Ref, u64)], r: Ref) -> Option<u64> {
+    pins.iter().find(|(p, _)| *p == r).map(|(_, v)| *v)
+}
+
 #[cfg(test)]
 mod event_ref_tests {
     use super::*;
@@ -3200,13 +3334,24 @@ mod compaction_tests {
         let mut control = compacting.clone();
         control.node_limit = usize::MAX;
         compacting.node_limit = compacting.arena.len() - 1;
+        crate::vm::diag::begin(START);
+        crate::vm::diag::set_pass(2);
 
         let control_stop = control.run(START, 1);
         let compacted_stop = compacting.run(START, 1);
+        let diagnostics = crate::vm::diag::take();
 
         assert!(matches!(control_stop, Stop::Return { .. }));
         assert!(matches!(compacted_stop, Stop::Return { .. }));
         assert!(compacting.arena.len() <= compacting.node_limit);
+        assert_eq!(diagnostics.compactions.len(), 1);
+        let record = &diagnostics.compactions[0];
+        assert_eq!(record.entry, START);
+        assert_eq!(record.pass, 2);
+        assert_eq!(record.site, START);
+        assert!(record.before > record.after);
+        assert!(record.after <= compacting.arena.len());
+        assert!(record.after <= compacting.node_limit);
     }
 
     #[test]
@@ -3315,6 +3460,9 @@ mod deadline_tests {
         }
     }
 
+    /// `jmp $`: one instruction that stays in the block forever. The back-edge stop
+    /// only fires on an indirect dispatch, so a direct self-jump really does spin
+    /// until some budget stops it -- which is the shape that overshot the deadline.
     const SPIN: &[u8] = &[0xeb, 0xfe];
 
     #[test]
@@ -3327,25 +3475,46 @@ mod deadline_tests {
         let started = std::time::Instant::now();
         let stop = emu.run(START, STEPS);
         let elapsed = started.elapsed();
+        let steps = emu.steps;
 
-        assert!(matches!(stop, Stop::Deadline { site } if site == START));
-        assert!(emu.steps < STEPS, "the step budget ended the block");
+        assert!(
+            matches!(stop, Stop::Deadline { site } if site == START),
+            "expected the wall clock to stop the block, got {stop:?}"
+        );
+        assert!(
+            steps < STEPS,
+            "the step budget, not the clock, ended the block ({steps} steps)"
+        );
+        // The point of the check: the overshoot is a few thousand instructions, not
+        // the whole step budget. The bound is loose on purpose -- it has to hold on a
+        // loaded machine -- but the run it replaces takes minutes.
         assert!(
             elapsed < Duration::from_secs(3),
-            "deadline overshot by {elapsed:?}"
+            "overshot a 50 ms deadline by {elapsed:?}"
         );
-        assert!(elapsed >= Duration::from_millis(50));
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "stopped before the deadline: {elapsed:?}"
+        );
     }
 
+    /// Nothing in the inspection path sets a clock, so a caller that does not ask for
+    /// one keeps the old behaviour exactly: the step budget is the only limit.
     #[test]
     fn without_a_deadline_the_step_budget_is_the_only_limit() {
         let pe = pe_with(SPIN);
         let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
-        assert!(emu.deadline.is_none());
+        assert!(
+            emu.deadline.is_none(),
+            "inspecting must not install a clock"
+        );
+
         assert!(matches!(emu.run(START, 64), Stop::Budget { site } if site == START));
         assert_eq!(emu.steps, 64);
     }
 
+    /// A block that finishes long before its deadline is untouched: same stop, same
+    /// site, same expression.
     #[test]
     fn a_generous_deadline_leaves_a_short_blocks_result_unchanged() {
         let pe = pe_with(&[0xc3]);
@@ -3356,14 +3525,99 @@ mod deadline_tests {
         let (Stop::Return { site: a, dest: da }, Stop::Return { site: b, dest: db }) =
             (plain.run(START, 1), clocked.run(START, 1))
         else {
-            panic!("a short block changed under a generous deadline")
+            panic!("a `ret` must end the block the same way with or without a clock")
         };
         assert_eq!(a, b);
         assert_eq!(plain.steps, clocked.steps);
         assert_eq!(
             plain.arena.structural_hash(da, 8),
-            clocked.arena.structural_hash(db, 8)
+            clocked.arena.structural_hash(db, 8),
+            "the returned expression must be identical"
         );
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    use crate::ir::expr::{Arena, Width};
+
+    /// Appending a pin for an already-pinned node cannot override it, because the
+    /// lookup is first-match-wins.
+    #[test]
+    fn a_later_pin_does_not_override_an_earlier_one() {
+        let mut a = Arena::default();
+        let x = a.opaque("x", Width::W64);
+        let y = a.opaque("y", Width::W64);
+        let z = a.opaque("z", Width::W64);
+        let pins = vec![(x, 1u64), (y, 7u64), (x, 0u64)];
+        assert_eq!(first_pin(&pins, x), Some(1), "the older entry wins");
+        assert_eq!(first_pin(&pins, y), Some(7));
+        assert_eq!(first_pin(&pins, z), None);
+    }
+
+    /// Removing the old entry is what lets a new value take effect, which is why a probe
+    /// that only pushed would report the wrong destination for the value it tested.
+    #[test]
+    fn removing_the_old_entry_is_what_lets_a_new_value_take_effect() {
+        let mut a = Arena::default();
+        let x = a.opaque("x", Width::W64);
+        let mut pins = vec![(x, 0u64)];
+        pins.push((x, 1));
+        assert_eq!(first_pin(&pins, x), Some(0), "appending changed nothing");
+        pins.retain(|(p, _)| *p != x);
+        pins.push((x, 1));
+        assert_eq!(
+            first_pin(&pins, x),
+            Some(1),
+            "the new value is now in force"
+        );
+    }
+
+    /// Diagnostics keep their stamps and stop being collected once taken, so a caller
+    /// that drains the sink cannot leak records into the next function.
+    #[test]
+    fn diagnostics_are_stamped_and_cleared() {
+        // Collection must stay opt-in: ordinary `Explorer::recover` callers never call
+        // `begin`, and a previous diagnostic is always shut down by `take`.
+        let _ = crate::vm::diag::take();
+        assert!(!crate::vm::diag::is_on());
+        crate::vm::diag::record_stop(crate::vm::diag::StopDiag::default());
+        assert!(crate::vm::diag::take().stops.is_empty(), "off means off");
+        crate::vm::diag::begin(0x1234);
+        crate::vm::diag::set_pass(2);
+        crate::vm::diag::record_stop(crate::vm::diag::StopDiag {
+            stop: "Diverged".into(),
+            ..Default::default()
+        });
+        let sink = crate::vm::diag::take();
+        assert_eq!(sink.stops.len(), 1);
+        assert_eq!(sink.stops[0].entry, 0x1234);
+        assert_eq!(sink.stops[0].pass, 2);
+        assert_eq!(sink.stops[0].stop, "Diverged");
+        assert_eq!(sink.final_pass, 2);
+        assert!(!crate::vm::diag::is_on());
+        crate::vm::diag::record_stop(crate::vm::diag::StopDiag::default());
+        assert!(crate::vm::diag::take().stops.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_time_is_excluded_per_pass_only_while_collection_is_on() {
+        crate::vm::diag::begin(0x1234);
+        crate::vm::diag::set_pass(1);
+        crate::vm::diag::measure(|| {
+            let mut value = 0u64;
+            for i in 0..10_000 {
+                value = std::hint::black_box(value.wrapping_add(i));
+            }
+        });
+        assert!(crate::vm::diag::excluded_time() > std::time::Duration::ZERO);
+
+        crate::vm::diag::set_pass(2);
+        assert_eq!(crate::vm::diag::excluded_time(), std::time::Duration::ZERO);
+        let _ = crate::vm::diag::take();
+        crate::vm::diag::measure(|| {});
+        assert_eq!(crate::vm::diag::excluded_time(), std::time::Duration::ZERO);
     }
 }
 

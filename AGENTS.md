@@ -21,22 +21,26 @@ discover    emulator + symbolic forking   phi/param   schedule   codegen + PE pa
 
 Key identity rule: a VM block is `(handler, vip)`; the VIP is an FNV-1a hash of the VIP slot plus the 0xa8-byte context window (`ir/lift.rs:508-540`).
 
-SSA scoping rule: an `Op::Param(owner, reg)` may only be used by the block it belongs to — it means "value of `reg` on entry to `owner`". Recovery cuts parameters only at the joins pass 1 found, so a pass-2 join or an unlocatable guest context leaves descendants reaching for an ancestor's parameter; `Cfg::localize_params` (`ir/ir.rs`, called from `Cfg::recover` in `vm/explore.rs:170`) rewrites those into parameters of the using block, which `Cfg::phis` then feeds from each predecessor's `exit_regs`. `src/ir/sched.rs:291-296` debug-asserts the invariant.
+SSA scoping rule: an `Op::Param(owner, reg)` may only be used by the block it belongs to — it means "value of `reg` on entry to `owner`". Recovery cuts parameters only at the joins pass 1 found, so a pass-2 join or an unlocatable guest context leaves descendants reaching for an ancestor's parameter; `Cfg::localize_params` (`ir/ir.rs`, called from `Cfg::recover` in `vm/explore.rs:389`) rewrites those into parameters of the using block, which `Cfg::phis` then feeds from each predecessor's `exit_regs`. `src/ir/sched.rs:291-296` debug-asserts the invariant.
+
+Recovery diagnostics: `vm/diag.rs` is an opt-in thread-local collector (pin/flag/switch probes, stops, compactions, divergence), and `RecoveryDeadline` subtracts the time spent inside it so measuring never changes what is measured. `UnresolvedStats` (`vm/explore.rs`) buckets every `Terminator::Unresolved` reason into families and separates budget truncation from genuine failure — `truncated` (blocks carrying `block budget reached`) is checked against the arithmetic prediction `blocks − budget`, and a mismatch is reported rather than hidden. `cli/diag.rs` exposes all of it as the `unresolved` subcommand, with `--json` for a machine-readable report.
 
 ## Key Directories
 
 | Path | Purpose |
 |---|---|
 | `src/binary/` | Hand-rolled PE32+ reader (`pe.rs`), format constants (`pe_format.rs`), iced-x86 decode wrappers (`disasm.rs`), pure patch builder (`writeback.rs`) |
-| `src/vm/` | Entry discovery (`discover.rs`), guest machine state (`state.rs`), CFG exploration (`explore.rs`) |
-| `src/ir/` | Core IR + terminators (`ir.rs`), hash-consed expression arena (`expr.rs`), FNV (`hash.rs`), emulator/lifter (`lift.rs`, ~3600 lines), scheduling (`sched.rs`), allocation (`regalloc.rs`) |
+| `src/vm/` | Entry discovery + stub census (`discover.rs`), guest machine state (`state.rs`), CFG exploration + `UnresolvedStats` (`explore.rs`), opt-in diagnostics sink (`diag.rs`) |
+| `src/ir/` | Core IR + terminators (`ir.rs`), hash-consed expression arena (`expr.rs`), FNV (`hash.rs`), emulator/lifter (`lift.rs`, ~3900 lines), scheduling (`sched.rs`), allocation (`regalloc.rs`) |
 | `src/codegen/` | Instruction lowering (`emit.rs`), branches/terminators (`control.rs`), frame+validation (`function.rs`), layout (`layout.rs`), operand mapping (`operands.rs`), Win64 unwind (`unwind.rs`), unit tests (`tests.rs`) |
-| `src/cli/` | `inspect.rs`, `recover.rs` (dump-only), `emit.rs` (only place that writes files), `fmt.rs` (shared printers) |
+| `src/cli/` | `inspect.rs`, `recover.rs` (dump-only), `emit.rs` (only place that writes files), `fmt.rs` (shared printers), `diag.rs` (the `unresolved` subcommand) |
+| `src/vm/` | Entry discovery + stub census (`discover.rs`), guest machine state (`state.rs`), CFG exploration + `UnresolvedStats` (`explore.rs`), opt-in diagnostics sink (`diag.rs`) |
+| `docs/` | Mirror design/plan/validation notes for the arena-compaction work and the diagnostics |
 | `test/` | Fixture dir — one sample driver `test/ACE-SSC-DRV64.sys` (force-added despite `.gitignore:*.sys`) |
 
 No CI, no `tests/`/`benches/`, no scripts, no formatter/linter config anywhere in the repo.
 
-Five files hold most of the ~23.5k lines: `ir/sched.rs` (3684), `ir/lift.rs` (3679), `ir/expr.rs` (3538), `codegen/tests.rs` (2318), `codegen/emit.rs` (1851). Read them in ranges; grep for the function name first.
+Five files hold most of the ~26k lines: `ir/lift.rs` (3933), `ir/expr.rs` (3774), `ir/sched.rs` (3708), `codegen/tests.rs` (2318), `vm/explore.rs` (2243). Read them in ranges; grep for the function name first.
 
 ## Development Commands
 
@@ -50,16 +54,17 @@ cargo run -- <cmd> ...   # or ./target/debug/tvm-devirt.exe <cmd> ...
 ```
 
 ```bash
-tvm-devirt entries test/ACE-SSC-DRV64.sys --all   # lists 338 virtualized functions for this sample
+tvm-devirt entries test/ACE-SSC-DRV64.sys --all   # 192 proven locations here; --include-stubs restores all 338
 tvm-devirt trace  <input> <va> [--events] [--dispatches] [--tail N] [--break-at VA]
 tvm-devirt cfg    <input> <va> [--events] [--state] [--steps N] [--max-blocks N] [--timeout S]
 tvm-devirt ssa    <input> <va> [--joins-only]
 tvm-devirt lower  <input> <va>
-tvm-devirt devirt <input> <va> [--output file.bin] [--dis]
+tvm-devirt devirt <input> <va> [--output file.bin] [--dis] [--max-blocks N]
 tvm-devirt write-devirt <input> <output> [--jobs N] [--steps N] [--timeout S] [--max-blocks N]
+tvm-devirt unresolved <input> <va> [--steps N] [--max-blocks N] [--timeout S] [--json FILE]
 ```
 
-Also `info`, `dis --count N`, `vmctx --window N`. `--vm-section` (default `.tvm0`) exists on `info`, `entries`, `cfg`, `ssa`, `lower`, `write-devirt` only; `--stack-base` defaults to `0x7fff_fffe_fda0`; VAs accept `0x` prefixes.
+Also `info`, `dis --count N`, `vmctx --window N`. `--vm-section` (default `.tvm0`) exists on `info`, `entries`, `cfg`, `ssa`, `lower`, `write-devirt` only; `--max-blocks` defaults to 512 on `cfg`, `devirt`, `write-devirt` and `unresolved`, 256 on `ssa` and `lower`; `--stack-base` defaults to `0x7fff_fffe_fda0`; VAs accept `0x` prefixes.
 
 ### Debug env knobs (undocumented in README)
 
@@ -81,9 +86,12 @@ Also `info`, `dis --count N`, `vmctx --window N`. `--vm-section` (default `.tvm0
 
 | File | Why it matters |
 |---|---|
-| `src/main.rs` | clap `Cli`/`Cmd` definition (10 subcommands), dispatch into `cli::*`, `parse_u64` VA parser |
+| `src/main.rs` | clap `Cli`/`Cmd` definition (11 subcommands), dispatch into `cli::*`, `parse_u64` VA parser |
 | `src/vm/mod.rs` | `DEFAULT_STACK_BASE`, `DEFAULT_VM_SECTION` |
-| `src/ir/ir.rs` | `Cfg`, `Block`, `Terminator` — the document every pass consumes |
+| `src/vm/diag.rs` | Thread-local diagnostics sink: `begin`/`set_pass`/`record_*`/`take`; `excluded_time` feeds the recovery deadline |
+| `src/cli/diag.rs` | `cmd_unresolved` — the JSON report behind the `unresolved` subcommand |
+| `src/vm/explore.rs` | `Explorer` + `Cfg::recover` (calls `localize_params`), `UnresolvedStats`, `validate` / `CfgIssues` |
+| `src/ir/ir.rs` | `Cfg`, `Block`, `Terminator`, `phis`/`simplify_phis`/`localize_params` — the document every pass consumes |
 | `src/ir/lift.rs` | Emulator, `Event::{Store, Load, Boxed, Call}`, guest-context location |
 | `src/ir/expr.rs` | `Arena`, `Op`, folding constructors, `structural_hash` (arena-stable, ignores `Load` generation) |
 | `src/codegen/function.rs` | `plan_frame` + `unwind_info` contract, `TVM_STRICT_FRAME` gate |
@@ -100,11 +108,11 @@ Also `info`, `dis --count N`, `vmctx --window N`. `--vm-section` (default `.tvm0
 
 ## Testing & QA
 
-- Framework: plain `#[cfg(test)] mod tests` in-module (Rust's built-in harness). `cargo test` needs no external fixtures and runs 187 tests in well under a second.
-- Coverage is concentrated in the IR and codegen layers: `src/codegen/tests.rs` (child module declared at `codegen/mod.rs:26`, reaches private emitters), `src/ir/expr.rs`, `src/ir/lift.rs`, `src/ir/sched.rs`, `src/ir/regalloc.rs`, `src/vm/explore.rs`, `src/vm/state.rs`.
-- **Untested**: `src/main.rs`, all of `src/cli/`, PE parsing and patch building in `src/binary/` (`why_incomplete` is the only tested item there), `src/vm/discover.rs`, `src/ir/hash.rs`. Changes there need a manual smoke run against `test/ACE-SSC-DRV64.sys`.
+- Framework: plain `#[cfg(test)] mod tests` in-module (Rust's built-in harness). `cargo test` needs no external fixtures and runs 208 tests in well under a second.
+- Coverage is concentrated in the IR and codegen layers: `src/codegen/tests.rs` (child module declared at `codegen/mod.rs:26`, reaches private emitters), `src/ir/expr.rs`, `src/ir/lift.rs`, `src/ir/sched.rs`, `src/ir/regalloc.rs`, `src/vm/explore.rs`, `src/vm/state.rs`, `src/vm/discover.rs`, `src/cli/diag.rs`.
+- **Untested**: `src/main.rs`, `inspect.rs`/`recover.rs`/`emit.rs`/`fmt.rs` under `src/cli/`, PE parsing and patch building in `src/binary/`, `src/vm/diag.rs`, `src/ir/hash.rs`. Changes there need a manual smoke run against `test/ACE-SSC-DRV64.sys`.
 - Test naming is sentence-style snake_case describing the bug prevented, e.g. `a_spill_store_no_one_reads_is_removed` (`codegen/tests.rs:148`).
 - Assertions are text/structural, not golden files: `codegen/tests.rs` assembles with `CodeAssembler` and compares `NasmFormatter` output via helpers `emit_one`, `seg`, `disasm_bytes`; IR tests build synthetic PEs with `executable_pe` / `pe_with` (`ir/lift.rs:3085`, `:3322`).
 - Test-only helpers inside production modules are `#[cfg(test)]`-gated — keep them that way.
-- Smoke paths verified against the bundled sample: `entries` reports `discovered 338 virtualized functions`; `cfg`/`lower` recover 18 blocks (126 instructions) at `0x140001000`; `devirt` emits x86 for it. Use these to check a change end-to-end.
-- Full-pipeline check: `cargo run -- write-devirt test/ACE-SSC-DRV64.sys out.sys --jobs 8 --timeout 30` retargets 312 of 338 functions in ~85 s and writes a patched image. `--max-blocks 1024` gets 315: the trampolines `0x14000a9e0`, `0x14000aa40` and `0x14000b681` share VM entry `0x14008b459`, which recovers 689 blocks against a default budget of 512 (`prepare_one` in `src/binary/writeback.rs`). The remaining failures are named by `why_incomplete` — `unsupported at …: int 29h` / `int3` traps, `left image at …`, `unresolved branch at … (0 candidates)`, `block budget reached`, `CFG invariant: cannot_reach_exit|unidentified`. A worker panic there means an SSA-scoping regression — that is what `src/ir/sched.rs:291-296` exists to catch; never delete the assertion.
+- Smoke paths verified against the bundled sample: `entries` lists 192 proven locations by default and 338 with `--include-stubs`; `cfg`/`lower` recover 18 blocks (126 instructions) at `0x140001000`; `devirt` emits 877 bytes of x86 for it. Use these to check a change end-to-end.
+- Full-pipeline check: `cargo run -- write-devirt test/ACE-SSC-DRV64.sys out.sys --jobs 8 --timeout 30` reports `312 ready, 26 incomplete`, retargets 312 of 338 functions in ~85 s and writes a patched image; `--max-blocks 1024` gets `315 ready, 23` because the trampolines `0x14000a9e0`, `0x14000aa40` and `0x14000b681` share VM entry `0x14008b459`, which needs 689 blocks against the default budget of 512 (`prepare_one` in `src/binary/writeback.rs`). The sweep ends with the `UnresolvedStats` accounting (`unresolved=102 (block-budget truncated=21, genuine=81)`) plus the reason families (`left-image`, `block-budget`, `argument-dependent`, `unsupported`, `work-budget`, `unresolved-branch`) — `truncated` is cross-checked against `blocks − budget`, so a budget artefact can never be read as a recovery failure. A worker panic there means an SSA-scoping regression — that is what `src/ir/sched.rs:291-296` exists to catch; never delete the assertion.

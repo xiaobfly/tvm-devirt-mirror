@@ -89,6 +89,21 @@ src/codegen/  x86 emission, control flow, operands, frame layout, and unwind dat
 src/cli/      inspection, recovery, formatting, and writeback commands
 ```
 
+## Recovery Diagnostics
+
+Merged from the maintained mirror ([NeuroSaki987/tvm-devirt-mirror](https://github.com/NeuroSaki987/tvm-devirt-mirror), PRs #2/#3/#6). Everything below is always on except the flags it names.
+
+`unresolved` re-recovers one function and explains why it did not close: each unresolved block's reason, the indirect-branch expressions with their symbolic leaves and 0/1 candidate arms, CFG invariant violations, expression-DAG composition, and the compaction and divergence records kept during recovery. Diagnostic work is excluded from the recovery timeout, so measuring never changes what is measured.
+
+```bash
+tvm-devirt unresolved input.exe 0x140001000
+tvm-devirt unresolved input.exe 0x140001000 --json unresolved.json
+```
+
+- `devirt` and `write-devirt` take `--max-blocks` (default 512) and split unresolved blocks into budget-truncated and genuine ones, per function and summed over a sweep.
+- `entries` leaves out locations whose body is byte-proven padding — `int3` padding, `int 29h` fast-fail stubs, zero-pad aliases, missing `int3` tails: 192 of the 338 locations in `test/ACE-SSC-DRV64.sys`. `--include-stubs` restores the old census and `--aggressive-shape-filter` drops shape-only locations too. Which functions recovery attempts is unchanged.
+- Symbolic correctness: the bits an `OR` forces survive the `(A | c1) ^ c2` simplification, and symbolic memory bytes are extracted at the source width before being narrowed.
+
 ## Limitations
 
 - Codegen quality is far from perfect and the output binaries are meant for analysis only.
