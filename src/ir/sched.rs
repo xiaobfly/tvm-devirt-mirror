@@ -707,7 +707,9 @@ fn preserved_entry_bits(
         Op::Bin(BinOp::And, x, m) => {
             let mask = a.as_const(m)?;
             let bits = mask.trailing_ones();
-            if mask != u64::MAX >> (64 - bits) {
+            // A mask whose bit 0 is clear keeps no prefix of the value, so `x & 0` and
+            // `x & ~0xf` name nothing at all; `bits == 0` also keeps the shift below in range.
+            if bits == 0 || mask != u64::MAX >> (64 - bits) {
                 return None;
             }
             Some(preserved_entry_bits(a, x, q)?.min(bits))
@@ -3467,6 +3469,28 @@ mod tests {
             "RDI keeps only 32 bits, so it cannot stand in for a 64-bit read and the \
              rename must decline rather than substitute a zero-extended value"
         );
+    }
+
+    /// A mask that keeps no low bits names no prefix of the entry value, whatever the
+    /// rest of the mask is. Measuring its width as `64 - 0` used to overflow the shift
+    /// and abort recovery of a real function.
+    #[test]
+    fn a_mask_with_no_low_bits_preserves_nothing_of_the_entry_value() {
+        let mut a = Arena::default();
+        let in_rcx = a.init_reg(Reg::Rcx);
+        for mask in [0xffff_fff0, 0x1000_0000_0000_0000] {
+            let m = a.constant(mask, Width::W64);
+            let masked = a.bin(BinOp::And, in_rcx, m);
+            assert_eq!(
+                preserved_entry_bits(&a, masked, Reg::Rcx),
+                None,
+                "mask {mask:#x} keeps no low bit, so it cannot be the entry value"
+            );
+        }
+        // The useful shape still measures, so the guard did not swallow it.
+        let m = a.constant(0xffff_ffff, Width::W64);
+        let masked = a.bin(BinOp::And, in_rcx, m);
+        assert_eq!(preserved_entry_bits(&a, masked, Reg::Rcx), Some(32));
     }
 
     #[test]
