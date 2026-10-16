@@ -2,7 +2,7 @@
 
 use crate::binary::pe::PeFile;
 use crate::ir::expr::render;
-use crate::ir::expr::{self, Arena, Op, Ref, Reg, Width};
+use crate::ir::expr::{self, Arena, BinOp, Op, Ref, Reg, Width};
 use crate::ir::lift::{Emulator, Event, Stop};
 use crate::ir::{Block, BlockId, Cfg, Terminator, terminator_kind};
 use std::collections::{HashMap, HashSet};
@@ -989,6 +989,13 @@ impl<'a> Explorer<'a> {
             return t;
         }
 
+        // An index with no provable range gives the narrow-index split nothing to
+        // enumerate, but a table read is bounded by the table itself, so try the
+        // image before giving up on the branch.
+        if let Some(t) = self.split_table(task, site, dest, queue) {
+            return t;
+        }
+
         let leaves = expr::leaves(&task.emu.arena, dest);
         // Distinguish "we failed to fold" from "this genuinely depends on a function argument". An indirect dispatch whose index mixes in an `InitReg` (e.g.
         let arg_dependent = leaves
@@ -1189,6 +1196,111 @@ impl<'a> Explorer<'a> {
             });
         }
         None
+    }
+
+    /// Recover a switch whose arms are listed in an in-image table and selected by
+    /// an index the emulator cannot bound: `base + *(u32*)(tbl + idx*scale)`.
+    ///
+    /// `split_multiway` can only enumerate an index whose value range is provable
+    /// from known-zero bits, so an index read from memory or living in an argument
+    /// register presents it no candidate at all. The table supplies the bound
+    /// instead: the run of slots that name executable code is the arm list, and each
+    /// arm is taken by pinning the index to its slot, exactly as the narrow-index
+    /// split does.
+    fn split_table(
+        &self,
+        task: &mut Task<'a>,
+        site: u64,
+        dest: Ref,
+        queue: &mut Vec<Task<'a>>,
+    ) -> Option<Terminator> {
+        let TableRead {
+            idx,
+            scale,
+            tbl,
+            base,
+        } = table_read(&task.emu.arena, dest)?;
+        // Same rule the concrete load path applies: never fold a read from a page
+        // the loader or the runtime may have overwritten.
+        let readable = |va: u64| {
+            (!self.pe.is_writable(va) || self.pe.is_bss(va)) && !self.pe.is_loader_bound(va, 4)
+        };
+        if !readable(tbl) {
+            return None;
+        }
+
+        // The arm count is whatever the table says, not a per-site constant: slots
+        // are read until one is missing or does not name code, which is where the
+        // dispatcher's own range check ends the run (the sample pads its tables
+        // with `0xcccc_cccc`). Gaps are never skipped, because a non-executable
+        // slot is not evidence of a further arm. `MAX_SWITCH_ARMS` still caps the
+        // forks a misidentified table could cost.
+        let mut arms: Vec<(Emulator<'a>, u64)> = Vec::new();
+        let mut all_folded = true;
+        for k in 0..MAX_SWITCH_ARMS {
+            let Some(slot) = tbl.checked_add(k * scale) else {
+                break;
+            };
+            if !readable(slot) {
+                break;
+            }
+            let Some(entry) = self.pe.read_u32(slot) else {
+                break; // the table ran off the image
+            };
+            if !self.pe.is_executable(base.wrapping_add(u64::from(entry))) {
+                break; // the run of arms ends here
+            }
+            let mut fork = task.emu.clone();
+            fork.pins.push((idx, k));
+            let folded = fork.substitute(dest);
+            match fork.arena.as_const(folded) {
+                Some(t) if self.pe.is_executable(t) => arms.push((fork, t)),
+                // A slot the table calls code that does not fold to it means the
+                // enumeration assumption is broken: take no arm rather than some.
+                _ => {
+                    all_folded = false;
+                    break;
+                }
+            }
+        }
+        if !all_folded || arms.len() < 2 {
+            return None;
+        }
+
+        let mut ancestors = task.ancestors.clone();
+        ancestors.push(task.id);
+        let mut targets: Vec<BlockId> = Vec::new();
+        for (fork, t) in arms {
+            let id = BlockId {
+                handler: t,
+                vip: fork.current_vip(),
+            };
+            if !targets.contains(&id) {
+                targets.push(id);
+            }
+            queue.push(Task {
+                emu: fork,
+                resume: t,
+                id,
+                from: Some(task.id),
+                ancestors: ancestors.clone(),
+            });
+        }
+        if self.verbose {
+            eprintln!(
+                "     switch at {site:#x}: table {tbl:#x}[{scale}] -> {} arms",
+                targets.len()
+            );
+        }
+        if targets.len() == 1 {
+            // Every arm shares one block identity, so the dispatch has one target
+            // after all.
+            return Some(Terminator::Jump(targets[0]));
+        }
+        Some(Terminator::Switch {
+            selector: idx,
+            targets,
+        })
     }
 
     /// Everything still known about a branch that no split could resolve.
@@ -1538,6 +1650,83 @@ fn narrow_indices(a: &mut Arena, dest: Ref) -> Vec<(Ref, u64)> {
     // be the actual selector rather than an incidental subexpression.
     out.sort_by_key(|(_, span)| *span);
     out
+}
+
+/// A read of an in-image switch table selected by a symbolic index.
+///
+/// The dispatch it describes is `base + *(u32*)(tbl + idx*scale)`: slot `k` lives
+/// at `tbl + k*scale` and holds an offset relative to `base`.
+struct TableRead {
+    /// Index expression the table is read with. Symbolic, or there would be no branch to split.
+    idx: Ref,
+    /// Bytes between two slots.
+    scale: u64,
+    /// Address of slot 0.
+    tbl: u64,
+    /// Value the stored offsets are relative to.
+    base: u64,
+}
+
+/// Recognise `base + zext32(load32[tbl + idx*scale])`, the dispatch an RVA switch
+/// table compiles to.
+///
+/// Only the shape is judged here: whether the table address may be read at all is
+/// the caller's call, because that depends on the image. `None` means "not a table
+/// read", and the caller keeps the diagnostic it already had.
+fn table_read(a: &Arena, dest: Ref) -> Option<TableRead> {
+    // The stored offset is added to a constant, and the load itself is 32 bits
+    // wide, zero-extended to the destination's width before that addition.
+    let (x, base) = const_summand(a, dest)?;
+    let load = peel_zext(a, x);
+    let addr = match *a.op(load) {
+        Op::Load(addr, _) if a.width(load) == Width::W32 => addr,
+        _ => return None,
+    };
+    // `addr` is `idx*scale + tbl`, with `tbl` the concrete address the slot comes from.
+    let (scaled, tbl) = const_summand(a, addr)?;
+    let (idx, scale) = const_factor(a, scaled)?;
+    // Only the natural slot widths: a stride of three is not a table.
+    if !matches!(scale, 1 | 2 | 4 | 8) {
+        return None;
+    }
+    Some(TableRead {
+        idx,
+        scale,
+        tbl,
+        base,
+    })
+}
+
+/// `Bin(Add, other, Const(k))` in either operand order.
+fn const_summand(a: &Arena, r: Ref) -> Option<(Ref, u64)> {
+    match a.as_bin(r)? {
+        (BinOp::Add, x, y) => match (a.as_const(x), a.as_const(y)) {
+            (Some(k), None) => Some((y, k)),
+            (None, Some(k)) => Some((x, k)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `Bin(Mul, idx, Const(k))` in either operand order, with `idx` symbolic.
+fn const_factor(a: &Arena, r: Ref) -> Option<(Ref, u64)> {
+    match a.as_bin(r)? {
+        (BinOp::Mul, x, y) => match (a.as_const(x), a.as_const(y)) {
+            (Some(k), None) => Some((y, k)),
+            (None, Some(k)) => Some((x, k)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Strip the zero-extension the loaded offset carries before it meets the image base.
+fn peel_zext(a: &Arena, mut r: Ref) -> Ref {
+    while let Op::Zext(inner) = *a.op(r) {
+        r = inner;
+    }
+    r
 }
 
 /// Symbolic leaves that could be the decisive bit of a virtualized JCC.
@@ -2318,6 +2507,88 @@ mod candidate_tests {
                 probe.known_zero(c) | 1 == u64::MAX
             }),
             "candidates contain no provably one-bit value"
+        );
+    }
+
+    /// The dispatch the sample's three VM bodies fail on:
+    /// `base + zext32(load32[tbl + sext32(idx)*4])`. Every piece the enumeration
+    /// needs has to come out of the expression, so all of them are asserted: a
+    /// matcher that stopped checking that the table address is concrete, or that
+    /// the multiplier is the slot width, would read something that is not the table.
+    #[test]
+    fn table_read_finds_the_rva_table_dispatch() {
+        let mut a = Arena::new();
+        let rcx = a.init_reg(Reg::Rcx);
+        let idx32 = a.trunc(rcx, Width::W32);
+        let idx = a.sext(idx32, Width::W64);
+        let four = a.constant(4, Width::W64);
+        let scaled = a.bin(BinOp::Mul, idx, four);
+        let tbl = a.constant(0x140011664, Width::W64);
+        let addr = a.bin(BinOp::Add, scaled, tbl);
+        let load = a.load(addr, Width::W32);
+        let widened = a.zext(load, Width::W64);
+        let base = a.constant(0x140000000, Width::W64);
+        let dest = a.bin(BinOp::Add, widened, base);
+
+        let t = table_read(&a, dest).expect("the RVA table shape must be recognised");
+        assert_eq!(t.scale, 4, "the slot width is the multiplier, not a guess");
+        assert_eq!(
+            t.tbl, 0x140011664,
+            "the table address is the concrete addend"
+        );
+        assert_eq!(t.base, 0x140000000, "the image base is the concrete addend");
+        assert_eq!(
+            t.idx, idx,
+            "the index must be the register chain, not the scaled address"
+        );
+    }
+
+    /// Negative controls: a bare load is not a table read, a table at a symbolic
+    /// address has nothing to enumerate, and a stride that is not a slot width is
+    /// not a table.
+    #[test]
+    fn table_read_rejects_non_table_shapes() {
+        let mut a = Arena::new();
+        let base = a.constant(0x140000000, Width::W64);
+        let tbl = a.constant(0x140011664, Width::W64);
+
+        // A single load from a fixed address: no index, so nothing to split on.
+        let slot = a.load(tbl, Width::W32);
+        let slot = a.zext(slot, Width::W64);
+        let dest = a.bin(BinOp::Add, slot, base);
+        assert!(
+            table_read(&a, dest).is_none(),
+            "a load from a fixed address is not a table read"
+        );
+
+        let rcx = a.init_reg(Reg::Rcx);
+        let idx32 = a.trunc(rcx, Width::W32);
+        let idx = a.sext(idx32, Width::W64);
+
+        // The same shape with the table address in a register: index and scale are
+        // fine, but no slot address can be derived from the expression.
+        let four = a.constant(4, Width::W64);
+        let scaled = a.bin(BinOp::Mul, idx, four);
+        let symbolic_tbl = a.init_reg(Reg::Rdx);
+        let addr = a.bin(BinOp::Add, scaled, symbolic_tbl);
+        let load = a.load(addr, Width::W32);
+        let load = a.zext(load, Width::W64);
+        let dest = a.bin(BinOp::Add, load, base);
+        assert!(
+            table_read(&a, dest).is_none(),
+            "a table at a symbolic address is not enumerable"
+        );
+
+        // A stride of three bytes is not a slot width.
+        let three = a.constant(3, Width::W64);
+        let scaled = a.bin(BinOp::Mul, idx, three);
+        let addr = a.bin(BinOp::Add, scaled, tbl);
+        let load = a.load(addr, Width::W32);
+        let load = a.zext(load, Width::W64);
+        let dest = a.bin(BinOp::Add, load, base);
+        assert!(
+            table_read(&a, dest).is_none(),
+            "a stride of three bytes is not a slot width"
         );
     }
 }

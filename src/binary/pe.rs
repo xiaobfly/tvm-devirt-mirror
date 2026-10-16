@@ -213,6 +213,11 @@ impl PeFile {
         self.data.get(s.raw_address as usize + delta).copied()
     }
 
+    pub fn read_u32(&self, va: u64) -> Option<u32> {
+        let b = self.read_va(va, 4)?;
+        (b.len() == 4).then(|| u32::from_le_bytes(b.try_into().unwrap()))
+    }
+
     pub fn read_u64(&self, va: u64) -> Option<u64> {
         let b = self.read_va(va, 8)?;
         (b.len() == 8).then(|| u64::from_le_bytes(b.try_into().unwrap()))
